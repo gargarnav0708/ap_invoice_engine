@@ -1,0 +1,46 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+data/ap_invoices.db
+
+# User uploads & temporary scratch files
+data/uploads/*
+!data/uploads/.gitkeep
+data/sample_data/*
+!data/sample_data/scenario_*.pdf
+
+# Testing & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+
+# Streamlit local state
+.streamlit/
+.agents/
+
+# OS / IDE specific
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
