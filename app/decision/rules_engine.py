@@ -29,10 +29,16 @@ class RulesEngine:
         matched_po: Optional[PurchaseOrder],
         po_status: str,
         duplicate_check: DuplicateCheckResult,
-        line_item_matches: List[LineItemMatch]
+        line_item_matches: List[LineItemMatch],
+        financial_results: Optional[List[RuleResult]] = None
     ) -> List[RuleResult]:
         """
         Runs the full suite of AP validation rules.
+
+        ``financial_results`` may be supplied by the orchestrator when the
+        financial / PO-balance checks have already been executed (so the
+        pipeline's financial-validation stages report real outcomes without
+        running the validator twice). If omitted, they are computed here.
         """
         results: List[RuleResult] = []
 
@@ -265,8 +271,32 @@ class RulesEngine:
         # ======================================================================
         # 5. Financial Validation & PO Balance Rules
         # ======================================================================
-        financial_results = self.financial_validator.validate(normalized, matched_po)
+        if financial_results is None:
+            financial_results = self.financial_validator.validate(normalized, matched_po)
         results.extend(financial_results)
+
+        # Tax-rate reasonableness: tax should be a plausible fraction of subtotal.
+        tax_amt = normalized.tax_amount or 0.0
+        sub_amt = normalized.subtotal
+        if sub_amt and sub_amt > 0 and tax_amt > 0:
+            tax_rate = tax_amt / sub_amt
+            max_rate = rules_config.financial.MAX_REASONABLE_TAX_RATE_PCT
+            if tax_rate > max_rate:
+                results.append(
+                    RuleResult(
+                        rule_id="RULE_TAX_CALCULATION_DISCREPANCY",
+                        rule_name="Tax Rate Reasonableness",
+                        category="FINANCIAL",
+                        result=RuleStatus.WARN,
+                        severity=RuleSeverity.SOFT,
+                        expected_value=f"<= {max_rate*100:.0f}% of subtotal",
+                        actual_value=f"{tax_rate*100:.1f}%",
+                        explanation=(
+                            f"Declared tax (${tax_amt:.2f}) is {tax_rate*100:.1f}% of subtotal "
+                            f"(${sub_amt:.2f}), above the {max_rate*100:.0f}% reasonableness bound. Verify tax."
+                        )
+                    )
+                )
 
         # ======================================================================
         # 6. Line Item Validation Rules
@@ -284,6 +314,91 @@ class RulesEngine:
                         expected_value="All line items matched to PO",
                         actual_value=f"{len(unmatched_items)} items unmatched",
                         explanation=f"{len(unmatched_items)} invoice line items could not be matched to PO lines."
+                    )
+                )
+
+            # Price & quantity tolerance checks on matched lines.
+            price_review_pct = rules_config.matching.LINE_ITEM_PRICE_REVIEW_PCT
+            price_note_pct = rules_config.matching.LINE_ITEM_PRICE_TOLERANCE_PCT
+            qty_tol = rules_config.matching.LINE_ITEM_QTY_OVERAGE_TOLERANCE_ABS
+            price_review_lines = []
+            qty_over_lines = []
+
+            for m in line_item_matches:
+                if m.po_line_id is None:
+                    continue
+                inv_item = (
+                    normalized.line_items[m.invoice_line_idx]
+                    if 0 <= m.invoice_line_idx < len(normalized.line_items) else None
+                )
+
+                # Unit-price variance (invoice line vs PO line).
+                if m.price_diff is not None and inv_item is not None:
+                    po_unit_price = round(inv_item.unit_price - m.price_diff, 2)
+                    if po_unit_price > 0:
+                        var_pct = abs(m.price_diff) / po_unit_price
+                        line_ref = m.po_line_number or (m.invoice_line_idx + 1)
+                        if var_pct > price_review_pct:
+                            price_review_lines.append(
+                                f"line {line_ref}: ${po_unit_price:.2f} PO vs "
+                                f"${inv_item.unit_price:.2f} invoiced ({var_pct*100:.1f}%)"
+                            )
+                        elif var_pct > price_note_pct:
+                            results.append(
+                                RuleResult(
+                                    rule_id="RULE_LINE_ITEM_PRICE_VARIANCE",
+                                    rule_name="Line Item Price Within Tolerance",
+                                    category="LINE_ITEM",
+                                    result=RuleStatus.PASS,
+                                    severity=RuleSeverity.INFO,
+                                    expected_value=f"${po_unit_price:.2f} (PO)",
+                                    actual_value=f"${inv_item.unit_price:.2f}",
+                                    difference=f"{var_pct*100:.1f}%",
+                                    explanation=(
+                                        f"Line {line_ref} unit price varies {var_pct*100:.1f}% from PO, "
+                                        f"within the {price_review_pct*100:.0f}% review tolerance. Approved with note."
+                                    )
+                                )
+                            )
+
+                # Quantity overage (invoice billed more units than the PO line).
+                if m.qty_diff is not None and m.qty_diff > qty_tol:
+                    line_ref = m.po_line_number or (m.invoice_line_idx + 1)
+                    qty_over_lines.append(f"line {line_ref}: +{m.qty_diff:g} over PO")
+
+            if price_review_lines:
+                results.append(
+                    RuleResult(
+                        rule_id="RULE_LINE_ITEM_PRICE_VARIANCE",
+                        rule_name="Line Item Price Variance Exceeds Tolerance",
+                        category="LINE_ITEM",
+                        result=RuleStatus.WARN,
+                        severity=RuleSeverity.SOFT,
+                        expected_value=f"<= {price_review_pct*100:.0f}% vs PO unit price",
+                        actual_value=f"{len(price_review_lines)} line(s) over tolerance",
+                        explanation=(
+                            "Unit price exceeds PO beyond tolerance on "
+                            + "; ".join(price_review_lines)
+                            + ". Human review required."
+                        )
+                    )
+                )
+
+            if qty_over_lines:
+                results.append(
+                    RuleResult(
+                        rule_id="RULE_LINE_ITEM_QTY_OVERAGE",
+                        rule_name="Line Item Quantity Overage",
+                        category="LINE_ITEM",
+                        result=RuleStatus.WARN,
+                        severity=RuleSeverity.SOFT,
+                        expected_value="Invoiced qty <= PO qty",
+                        actual_value=f"{len(qty_over_lines)} line(s) over PO",
+                        explanation=(
+                            "Invoiced quantity exceeds the PO on "
+                            + "; ".join(qty_over_lines)
+                            + ". Human review required."
+                        )
                     )
                 )
 

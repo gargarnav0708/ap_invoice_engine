@@ -1,5 +1,7 @@
 """
-Streamlit Invoice Upload View: Drag-and-drop file upload and 1-click test scenario runners.
+Streamlit Invoice Upload View: Drag-and-drop file upload and 1-click test scenario
+runners, with a true live run view (each of the 19 stages ticking over as it
+executes) and a final decision card showing the reasoned outcome.
 """
 from pathlib import Path
 import streamlit as st
@@ -7,6 +9,38 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import settings
 from app.workflow.orchestrator import WorkflowOrchestrator
+from app.core.schemas import DecisionStatus
+
+
+# Canonical ordered list of the 19 pipeline stages, shown greyed-out before they run.
+PIPELINE_STAGES = [
+    "1. Receive invoice",
+    "2. Validate uploaded file",
+    "3. Calculate file hash",
+    "4. Check for exact duplicate",
+    "5. Extract PDF text",
+    "6. Run OCR when necessary",
+    "7. Extract structured invoice information",
+    "8. Validate extracted schema",
+    "9. Normalise extracted fields",
+    "10. Match vendor",
+    "11. Match purchase order",
+    "12. Detect duplicate invoices",
+    "13. Match line items",
+    "14. Run financial validation",
+    "15. Run PO balance validation",
+    "16. Generate final decision",
+    "17. Save all results",
+    "18. Update invoice and PO records",
+    "19. Generate the final audit report",
+]
+
+_STATUS_ICON = {
+    "PENDING": "⚪",
+    "RUNNING": "⏳",
+    "COMPLETED": "✅",
+    "FAILED": "❌",
+}
 
 
 def render_upload(session: Session):
@@ -30,84 +64,155 @@ def render_upload(session: Session):
                 st.write(f"**File Size:** `{len(uploaded_file.getvalue()) / 1024:.1f} KB`")
 
             if st.button("🚀 Process Invoice Now", type="primary", use_container_width=True):
-                with st.spinner("Processing invoice through 19-stage pipeline..."):
-                    try:
-                        file_bytes = uploaded_file.getvalue()
-                        inv_entity, run_entity = orchestrator.process_invoice(
-                            file_bytes=file_bytes,
-                            original_filename=uploaded_file.name
-                        )
-                        st.session_state["selected_invoice_id"] = inv_entity.id
-                        st.session_state["latest_run_id"] = run_entity.id
-                        st.success(f"Processing Complete! Decision: **{inv_entity.final_decision}**")
-                        st.info("Navigate to 'Live Processing View' or 'Invoice Details' to inspect the audit trail.")
-                    except Exception as e:
-                        st.error(f"Processing failed: {e}")
+                _run_with_live_view(
+                    orchestrator,
+                    file_bytes=uploaded_file.getvalue(),
+                    filename=uploaded_file.name,
+                    title=uploaded_file.name,
+                )
 
     with tab_scenarios:
         st.subheader("Run Verified Case Study Scenarios")
         st.write("Demonstrate the core AP engine capabilities on synthetic benchmark fixtures:")
 
+        scenarios = [
+            ("Scenario 1: Clean Invoice",
+             "Approved vendor ('Acme Industrial Supplies'), valid PO ('PO-2026-001'), matching line items and math.",
+             "APPROVED", "scenario_1_clean_invoice.pdf", "btn_s1"),
+            ("Scenario 2: Duplicate Invoice",
+             "Re-submission of the identical clean invoice file / invoice number.",
+             "BLOCKED (Confirmed Duplicate)", "scenario_2_duplicate_invoice.pdf", "btn_s2"),
+            ("Scenario 3: Split PO Overbilling",
+             "PO-2026-002 has only $500 remaining balance. Invoice bills $1,100, exceeding available balance.",
+             "BLOCKED (PO Balance Exceeded)", "scenario_3_split_overbilling.pdf", "btn_s3"),
+            ("Scenario 4: Incomplete / Unreadable Invoice",
+             "Document missing invoice number, PO reference, and clear tax arithmetic.",
+             "NEEDS_REVIEW (Missing Critical Fields)", "scenario_4_incomplete_invoice.pdf", "btn_s4"),
+        ]
+
         col1, col2 = st.columns(2)
+        for idx, (name, desc, expected, filename, key) in enumerate(scenarios):
+            target = col1 if idx % 2 == 0 else col2
+            with target:
+                st.markdown(f"### {name}")
+                st.caption(desc)
+                st.caption(f"🎯 **Expected Outcome:** `{expected}`")
+                if st.button(f"▶ Run {name.split(':')[0]}", key=key, use_container_width=True):
+                    st.session_state["_pending_scenario"] = (filename, name)
+                st.markdown("---")
 
-        with col1:
-            st.markdown("### Scenario 1: Clean Invoice")
-            st.caption("Approved vendor ('Acme Industrial Supplies'), valid PO ('PO-2026-001'), matching line items and math.")
-            st.caption("🎯 **Expected Outcome:** `APPROVED`")
-            if st.button("▶ Run Scenario 1", key="btn_s1", use_container_width=True):
-                s1_file = settings.SAMPLE_DATA_DIR / "scenario_1_clean_invoice.pdf"
-                _run_file_scenario(orchestrator, s1_file, "Scenario 1: Clean Invoice")
-
-            st.markdown("---")
-
-            st.markdown("### Scenario 3: Split PO Overbilling")
-            st.caption("PO-2026-002 has only $500 remaining balance. Invoice bills $1,100, exceeding available balance.")
-            st.caption("🎯 **Expected Outcome:** `BLOCKED` (PO Balance Exceeded)")
-            if st.button("▶ Run Scenario 3", key="btn_s3", use_container_width=True):
-                s3_file = settings.SAMPLE_DATA_DIR / "scenario_3_split_overbilling.pdf"
-                _run_file_scenario(orchestrator, s3_file, "Scenario 3: Split Overbilling")
-
-        with col2:
-            st.markdown("### Scenario 2: Duplicate Invoice")
-            st.caption("Re-submission of the identical clean invoice file / invoice number.")
-            st.caption("🎯 **Expected Outcome:** `BLOCKED` (Confirmed Duplicate)")
-            if st.button("▶ Run Scenario 2", key="btn_s2", use_container_width=True):
-                s2_file = settings.SAMPLE_DATA_DIR / "scenario_2_duplicate_invoice.pdf"
-                _run_file_scenario(orchestrator, s2_file, "Scenario 2: Duplicate Invoice")
-
-            st.markdown("---")
-
-            st.markdown("### Scenario 4: Incomplete / Unreadable Invoice")
-            st.caption("Document missing invoice number, PO reference, and clear tax arithmetic.")
-            st.caption("🎯 **Expected Outcome:** `NEEDS_REVIEW` (Missing Critical Fields)")
-            if st.button("▶ Run Scenario 4", key="btn_s4", use_container_width=True):
-                s4_file = settings.SAMPLE_DATA_DIR / "scenario_4_incomplete_invoice.pdf"
-                _run_file_scenario(orchestrator, s4_file, "Scenario 4: Incomplete Invoice")
+    # Run a queued scenario below the grid so the live view spans full width.
+    pending = st.session_state.pop("_pending_scenario", None)
+    if pending:
+        filename, name = pending
+        file_path = settings.SAMPLE_DATA_DIR / filename
+        if not file_path.exists():
+            st.error(f"Sample fixture not found at {file_path}. Run generate_test_invoices.py first.")
+        else:
+            _run_with_live_view(
+                orchestrator,
+                file_bytes=file_path.read_bytes(),
+                filename=filename,
+                title=name,
+            )
 
 
-def _run_file_scenario(orchestrator: WorkflowOrchestrator, file_path: Path, title: str):
-    if not file_path.exists():
-        st.error(f"Sample fixture not found at {file_path}. Run generate_test_invoices.py first.")
+def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, filename: str, title: str):
+    """Executes the pipeline while streaming each stage into a live view, then
+    renders the final reasoned decision card."""
+    st.markdown(f"### ⚙️ Live Run — {title}")
+    stage_placeholder = st.empty()
+
+    # Stage state and ordering (local copies so runs never mutate module globals).
+    stages_order = list(PIPELINE_STAGES)
+    stage_state = {name: {"status": "PENDING", "details": None, "duration_ms": None}
+                   for name in stages_order}
+
+    def render():
+        lines = []
+        for name in stages_order:
+            s = stage_state[name]
+            icon = _STATUS_ICON.get(s["status"], "⚪")
+            line = f"{icon} **{name}**"
+            if s["status"] == "COMPLETED" and s["duration_ms"] is not None:
+                line += f"  ·  _{s['duration_ms']:.0f} ms_"
+            lines.append(line)
+            if s["details"] and s["status"] in ("COMPLETED", "FAILED"):
+                lines.append(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {s['details']}")
+        stage_placeholder.markdown("\n\n".join(lines))
+
+    def on_event(event: dict):
+        name = event.get("stage_name")
+        if name not in stage_state:
+            # Unknown label — append it so nothing is silently dropped.
+            stage_state[name] = {"status": "PENDING", "details": None, "duration_ms": None}
+            stages_order.append(name)
+        if event["type"] == "start":
+            stage_state[name]["status"] = "RUNNING"
+        elif event["type"] == "complete":
+            stage_state[name]["status"] = "COMPLETED"
+            stage_state[name]["details"] = event.get("details")
+            stage_state[name]["duration_ms"] = event.get("duration_ms")
+        elif event["type"] == "fail":
+            stage_state[name]["status"] = "FAILED"
+            stage_state[name]["details"] = event.get("error")
+            stage_state[name]["duration_ms"] = event.get("duration_ms")
+        render()
+
+    render()  # initial all-pending render
+    try:
+        inv_entity, run_entity = orchestrator.process_invoice(
+            file_bytes=file_bytes,
+            original_filename=filename,
+            progress_callback=on_event,
+        )
+    except Exception as e:
+        st.error(f"Processing failed: {e}")
         return
 
-    with st.spinner(f"Executing {title}..."):
-        try:
-            with open(file_path, "rb") as f:
-                data = f.read()
-            inv_entity, run_entity = orchestrator.process_invoice(
-                file_bytes=data,
-                original_filename=file_path.name
-            )
-            st.session_state["selected_invoice_id"] = inv_entity.id
-            st.session_state["latest_run_id"] = run_entity.id
+    st.session_state["selected_invoice_id"] = inv_entity.id
+    st.session_state["latest_run_id"] = run_entity.id
 
-            decision_color = {
-                "APPROVED": "green",
-                "NEEDS_REVIEW": "orange",
-                "BLOCKED": "red"
-            }.get(inv_entity.final_decision, "blue")
+    _render_decision_card(inv_entity, run_entity)
 
-            st.markdown(f"#### Result: :{decision_color}[{inv_entity.final_decision}]")
-            st.success(f"Processing completed for {file_path.name} (Invoice ID: {inv_entity.id})")
-        except Exception as e:
-            st.error(f"Execution failed: {e}")
+
+def _render_decision_card(inv_entity, run_entity):
+    """Renders the final reasoned decision with reasons and the recommended next action."""
+    decision = getattr(run_entity, "decision_result", None)
+    status = inv_entity.final_decision
+
+    st.markdown("### Decision")
+    palette = {
+        "APPROVED": ("green", "🟢"),
+        "NEEDS_REVIEW": ("orange", "🟠"),
+        "BLOCKED": ("red", "🔴"),
+    }
+    color, emoji = palette.get(status, ("blue", "🔵"))
+
+    st.markdown(f"## {emoji} :{color}[{status}]")
+    if decision is not None:
+        st.write(decision.summary)
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Decision", status)
+    col_b.metric("Extraction Confidence", f"{(inv_entity.extraction_confidence or 0)*100:.0f}%")
+    col_c.metric("Processing Time", f"{run_entity.duration_ms:.0f} ms" if run_entity.duration_ms else "—")
+
+    if decision is not None:
+        if decision.checks_failed:
+            st.markdown("#### Why")
+            for item in decision.checks_failed:
+                st.markdown(f"- ❌ {item}")
+        if decision.warnings:
+            st.markdown("#### Flags")
+            for item in decision.warnings:
+                st.markdown(f"- ⚠️ {item}")
+        st.info(f"**Recommended action:** {decision.recommended_action}")
+        with st.expander(f"All checks ({len(decision.checks_passed)} passed)", expanded=False):
+            for item in decision.checks_passed:
+                st.markdown(f"- ✅ {item}")
+
+    st.success(
+        f"Invoice #{inv_entity.id} processed. "
+        "Open **Invoice Details** for the full audit workbench, or **Live Processing View** for the saved stage trace."
+    )

@@ -5,12 +5,15 @@ Main Streamlit application entry point.
 import streamlit as st
 from app.config.settings import settings
 from app.database.db import init_db, get_db
+from app.utils.logging import get_logger
 from app.ui.dashboard import render_dashboard
 from app.ui.upload import render_upload
 from app.ui.processing_view import render_processing_view
 from app.ui.invoice_history import render_invoice_history
 from app.ui.invoice_details import render_invoice_details
 from app.ui.settings_view import render_settings
+
+logger = get_logger("main")
 
 # Configure page layout and title
 st.set_page_config(
@@ -20,8 +23,55 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize database tables on startup
-init_db()
+
+def _apply_secrets() -> None:
+    """Bridge Streamlit secrets (used on Streamlit Community Cloud) into the
+    settings object so a deployed app can use live LLM extraction without a
+    committed .env. Env vars still take priority when already set."""
+    try:
+        secrets = st.secrets
+    except Exception:
+        return
+    for key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
+        try:
+            val = secrets.get(key) if hasattr(secrets, "get") else secrets[key]
+        except Exception:
+            val = None
+        if val:
+            setattr(settings, key, str(val))
+
+
+@st.cache_resource
+def _bootstrap() -> bool:
+    """One-time startup: create tables, seed procurement data, and generate the
+    sample invoice fixtures if they are missing. Cached so it runs once per
+    server process (safe for a fresh container on Streamlit Cloud)."""
+    init_db()
+    try:
+        from app.database.db import get_db
+        from app.database.entities import Vendor
+        with get_db() as session:
+            vendor_count = session.query(Vendor).count()
+        if vendor_count == 0:
+            from scripts.seed_database import seed
+            seed()
+            logger.info("Bootstrap: seeded procurement database.")
+    except Exception as e:
+        logger.error(f"Bootstrap seeding failed: {e}")
+
+    try:
+        sample = settings.SAMPLE_DATA_DIR / "scenario_1_clean_invoice.pdf"
+        if not sample.exists():
+            from scripts.generate_test_invoices import generate_all_scenarios
+            generate_all_scenarios()
+            logger.info("Bootstrap: generated sample invoice fixtures.")
+    except Exception as e:
+        logger.error(f"Bootstrap fixture generation failed: {e}")
+    return True
+
+
+_apply_secrets()
+_bootstrap()
 
 
 def main():

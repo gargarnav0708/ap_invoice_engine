@@ -2,7 +2,7 @@
 Data normalisation functions for financial values, vendor names, dates, currencies, and identifiers.
 """
 import re
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime
 from dateutil import parser as date_parser
 

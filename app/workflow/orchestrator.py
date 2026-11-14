@@ -3,7 +3,7 @@ Central Workflow Orchestrator coordinating all 19 processing stages for AP invoi
 Supports atomic transactions, idempotent reruns, and human overrides.
 """
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 from datetime import datetime, timezone
 import time
 import json
@@ -61,12 +61,18 @@ class WorkflowOrchestrator:
         file_bytes: Optional[bytes] = None,
         original_filename: str = "invoice.pdf",
         existing_file_path: Optional[Path] = None,
-        existing_invoice_id: Optional[int] = None
+        existing_invoice_id: Optional[int] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None
     ) -> Tuple[Invoice, ProcessingRun]:
         """
         Executes the end-to-end 19-stage AP invoice processing workflow.
+
+        ``progress_callback`` is an optional function that receives a dict for
+        every stage start / completion / failure, enabling a live run view.
+        The resulting ``ProcessingRun`` carries the computed ``DecisionResult``
+        on a transient ``decision_result`` attribute for the caller to render.
         """
-        exec_logger = ExecutionLogger()
+        exec_logger = ExecutionLogger(on_event=progress_callback)
         start_time_perf = time.perf_counter()
         start_time_dt = datetime.now(timezone.utc)
 
@@ -200,14 +206,32 @@ class WorkflowOrchestrator:
             line_item_matches = self.line_matcher.match_line_items(normalized, matched_po)
             exec_logger.complete_stage(f"Matched {len(line_item_matches)} line items to PO lines.")
 
-            # Stage 14: Run financial validation & Stage 15: Run PO balance validation
+            # Stage 14: Run financial validation (arithmetic, subtotal, tax, currency)
             exec_logger.start_stage("14. Run financial validation")
-            # Evaluated as part of rules engine
-            exec_logger.complete_stage("Arithmetic, subtotal, and tax consistency validated.")
+            financial_results = self.rules_engine.financial_validator.validate(normalized, matched_po)
+            fin_fails = [r for r in financial_results
+                         if r.category == "FINANCIAL" and r.result == RuleStatus.FAIL]
+            fin_checks = [r for r in financial_results if r.category == "FINANCIAL"]
+            if fin_fails:
+                exec_logger.complete_stage(
+                    f"{len(fin_checks)} financial check(s): {len(fin_fails)} failed — "
+                    + "; ".join(r.rule_name for r in fin_fails)
+                )
+            else:
+                exec_logger.complete_stage(
+                    f"{len(fin_checks)} financial check(s) passed (arithmetic, subtotal, tax, currency)."
+                )
 
+            # Stage 15: Run PO balance validation (cumulative billing vs remaining balance)
             exec_logger.start_stage("15. Run PO balance validation")
-            # Evaluated as part of rules engine
-            exec_logger.complete_stage("PO balance and cumulative billing evaluated.")
+            balance_results = [r for r in financial_results if r.category == "BALANCE"]
+            balance_fail = next((r for r in balance_results if r.result == RuleStatus.FAIL), None)
+            if balance_fail:
+                exec_logger.complete_stage(f"PO balance check FAILED: {balance_fail.explanation}")
+            elif balance_results:
+                exec_logger.complete_stage(f"PO balance check passed: {balance_results[0].explanation}")
+            else:
+                exec_logger.complete_stage("No PO linked; balance check not applicable.")
 
             # Stage 16: Generate final decision
             exec_logger.start_stage("16. Generate final decision")
@@ -219,7 +243,8 @@ class WorkflowOrchestrator:
                 matched_po=matched_po,
                 po_status=po_status,
                 duplicate_check=dup_check,
-                line_item_matches=line_item_matches
+                line_item_matches=line_item_matches,
+                financial_results=financial_results
             )
             decision = self.decision_service.determine_decision(validation_results)
             exec_logger.complete_stage(f"Final Decision generated: {decision.status.value}")
@@ -319,6 +344,8 @@ class WorkflowOrchestrator:
             run_entity.stages_log = exec_logger.to_json()
 
             self.session.commit()
+            # Transient attribute for the caller's live decision card (not persisted).
+            run_entity.decision_result = decision
             logger.info(f"Processing run completed for invoice {invoice_entity.id} in {duration_total_ms:.1f}ms with decision {decision.status.value}")
             return invoice_entity, run_entity
 

@@ -21,6 +21,12 @@ class MatchingConfig:
     LINE_ITEM_DESCRIPTION_SIMILARITY_THRESHOLD: float = 0.65
     LINE_ITEM_PRICE_TOLERANCE_PCT: float = 0.01  # 1% price tolerance
 
+    # Price/quantity variance tolerances (invoice line vs matched PO line).
+    # Within tolerance -> approve with an informational note.
+    # Outside tolerance -> flag for human review (soft failure).
+    LINE_ITEM_PRICE_REVIEW_PCT: float = 0.05        # >5% unit-price variance -> review
+    LINE_ITEM_QTY_OVERAGE_TOLERANCE_ABS: float = 0.001  # any qty billed over the PO line -> review
+
 
 @dataclass
 class FinancialValidationConfig:
@@ -84,6 +90,8 @@ class DecisionPolicyConfig:
         "RULE_LOW_EXTRACTION_CONFIDENCE",
         "RULE_MISSING_CRITICAL_FIELD",
         "RULE_LINE_ITEM_MISMATCH",
+        "RULE_LINE_ITEM_PRICE_VARIANCE",
+        "RULE_LINE_ITEM_QTY_OVERAGE",
         "RULE_TAX_CALCULATION_DISCREPANCY",
         "RULE_ARITHMETIC_DISCREPANCY",
     )

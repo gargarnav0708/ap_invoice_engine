@@ -121,12 +121,13 @@ The central `WorkflowOrchestrator` coordinates the end-to-end lifecycle of every
 ## 4. Installation & Environment Setup
 
 ### Prerequisites
-- Python 3.10+ (tested on Python 3.14)
-- (Optional) Tesseract OCR installed on the host system (`brew install tesseract` on macOS). If not installed, the engine gracefully utilizes the built-in OCR fallback without crashing.
+- Python 3.11 (pinned via `runtime.txt`; tested on 3.11–3.13).
+- (Optional) Tesseract OCR on the host (`brew install tesseract` on macOS, `apt-get install tesseract-ocr` on Debian/Ubuntu). If absent, the engine falls back gracefully without crashing. On Streamlit Community Cloud this is installed automatically via `packages.txt`.
 
-### Step 1: Clone or Navigate to Directory
+### Step 1: Clone the Repository
 ```bash
-cd /Users/herr_ag98/.gemini/antigravity/scratch/ap_invoice_engine
+git clone https://github.com/gargarnav0708/ap_invoice_engine
+cd ap_invoice_engine
 ```
 
 ### Step 2: Install Dependencies
@@ -164,7 +165,11 @@ TESSERACT_CMD=
 
 ## 5. Database Initialization & Synthetic Fixtures
 
-Initialize and seed the database with 5 vendors, 10 POs, and generate the 4 test scenario PDFs:
+The app **self-seeds on first launch**: on startup it creates the tables, seeds
+5 vendors and 10 POs if the database is empty, and generates the 4 benchmark
+invoice PDFs if they are missing. No manual step is required for a fresh deploy.
+
+To seed manually (e.g. for CLI testing):
 
 ```bash
 # 1. Initialize tables and seed procurement records
@@ -184,6 +189,17 @@ Launch the Streamlit web dashboard:
 PYTHONPATH=. streamlit run app/main.py
 ```
 Open your browser to: **`http://localhost:8501`**
+
+Upload an invoice (or use the **Quick Test Scenarios** tab). Each run streams
+its 19 stages live as they execute and ends with a reasoned **decision card**
+(status, the reasons behind it, and the recommended next action).
+
+### Deploy on Streamlit Community Cloud
+
+1. Push this repo to GitHub and point [share.streamlit.io](https://share.streamlit.io) at `app/main.py`.
+2. `packages.txt` installs Tesseract OCR and `runtime.txt` pins Python 3.11 automatically.
+3. (Optional) For live LLM extraction, open **App → Settings → Secrets** and paste the contents of `.streamlit/secrets.toml.example`, filling in `LLM_API_KEY`. Left blank, the app runs the deterministic demo extractor with no network calls.
+4. The database and sample fixtures are created automatically on first load.
 
 ---
 

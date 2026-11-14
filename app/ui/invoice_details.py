@@ -84,19 +84,78 @@ def render_invoice_details(session: Session):
 
     with col_fields:
         st.subheader("Extracted Structured Fields")
-        fields_data = [
-            {"Field": "Vendor Name", "Value": invoice.vendor.legal_name if invoice.vendor else "Unmatched", "Confidence": f"{invoice.extraction_confidence*100:.0f}%"},
-            {"Field": "Invoice Number", "Value": invoice.invoice_number or "N/A", "Confidence": "95%"},
-            {"Field": "Invoice Date", "Value": invoice.invoice_date or "N/A", "Confidence": "95%"},
-            {"Field": "Payment Due Date", "Value": invoice.due_date or "N/A", "Confidence": "90%"},
-            {"Field": "PO Reference", "Value": invoice.po_reference or "N/A", "Confidence": "95%"},
-            {"Field": "Currency", "Value": invoice.currency or "USD", "Confidence": "95%"},
-            {"Field": "Subtotal", "Value": f"${invoice.subtotal:.2f}" if invoice.subtotal is not None else "N/A", "Confidence": "95%"},
-            {"Field": "Tax Amount", "Value": f"${invoice.tax_amount:.2f}" if invoice.tax_amount is not None else "N/A", "Confidence": "95%"},
-            {"Field": "Total Amount", "Value": f"${invoice.total_amount:.2f}" if invoice.total_amount is not None else "N/A", "Confidence": "95%"},
-            {"Field": "SHA-256 Hash", "Value": invoice.file_hash[:16] + "...", "Confidence": "100%"},
+
+        # Parse the persisted extraction payload for real per-field confidence
+        # and the verbatim evidence snippet each value was taken from.
+        extracted = {}
+        try:
+            extracted = json.loads(invoice.extracted_data) if invoice.extracted_data else {}
+        except Exception:
+            extracted = {}
+
+        def fld(key: str):
+            """Returns (value, confidence_pct_str, evidence) for an extracted field."""
+            obj = extracted.get(key) if isinstance(extracted, dict) else None
+            if isinstance(obj, dict):
+                conf = obj.get("confidence")
+                conf_str = f"{conf*100:.0f}%" if isinstance(conf, (int, float)) else "—"
+                ev = obj.get("evidence") or "—"
+                return obj.get("value"), conf_str, ev
+            return None, "—", "—"
+
+        provider_note = "Demo / rule-based extractor" if extracted.get("is_mock", True) else "LLM extractor"
+        st.caption(f"Confidence and evidence are reported per field by the {provider_note}.")
+
+        field_specs = [
+            ("Vendor Name", "vendor_name", None),
+            ("Invoice Number", "invoice_number", None),
+            ("Invoice Date", "invoice_date", None),
+            ("Payment Due Date", "due_date", None),
+            ("PO Reference", "po_reference", None),
+            ("Currency", "currency", None),
+            ("Tax ID", "vendor_tax_id", None),
+            ("Subtotal", "subtotal", "money"),
+            ("Tax Amount", "tax_amount", "money"),
+            ("Total Amount", "total_amount", "money"),
         ]
-        st.table(pd.DataFrame(fields_data))
+
+        fields_data = []
+        for label, key, kind in field_specs:
+            value, conf_str, ev = fld(key)
+            if value is None:
+                shown = "— (not found)"
+            elif kind == "money":
+                try:
+                    shown = f"${float(value):,.2f}"
+                except (TypeError, ValueError):
+                    shown = str(value)
+            else:
+                shown = str(value)
+            ev_short = ev if len(str(ev)) <= 48 else str(ev)[:45] + "…"
+            fields_data.append(
+                {"Field": label, "Value": shown, "Confidence": conf_str, "Evidence": ev_short}
+            )
+
+        fields_data.append(
+            {"Field": "SHA-256 Hash", "Value": invoice.file_hash[:16] + "…",
+             "Confidence": "100%", "Evidence": "binary file hash"}
+        )
+
+        st.dataframe(
+            pd.DataFrame(fields_data),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Confidence": st.column_config.TextColumn(
+                    "Conf.", help="Per-field extraction confidence (lower = more likely to need review)"
+                ),
+                "Evidence": st.column_config.TextColumn(
+                    "Evidence", help="Verbatim snippet the value was extracted from"
+                ),
+            },
+        )
+        if extracted.get("overall_confidence") is not None:
+            st.caption(f"Overall extraction confidence: **{extracted['overall_confidence']*100:.0f}%**")
 
     st.markdown("---")
 

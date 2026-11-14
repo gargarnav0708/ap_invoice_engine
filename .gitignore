@@ -33,8 +33,9 @@ htmlcov/
 .tox/
 .mypy_cache/
 
-# Streamlit local state
-.streamlit/
+# Streamlit local state (keep config.toml and secrets example tracked;
+# never commit real secrets)
+.streamlit/secrets.toml
 .agents/
 
 # OS / IDE specific
