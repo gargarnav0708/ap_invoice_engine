@@ -1,0 +1,988 @@
+From 6c51fb0895ceefaa81c4727e7892190ecbf6b984 Mon Sep 17 00:00:00 2001
+From: Prasoon Raj <prasoontrex4096@gmail.com>
+Date: Sat, 14 Nov 2026 13:37:23 +0000
+Subject: [PATCH] Tier 0 + Tier 1: runnable fixes, live run view, tolerance
+ rules, real confidence
+
+Tier 0 (blockers):
+- Fix NameError in normalizer (missing Any import); pin Python via runtime.txt
+- Deploy config: packages.txt (Tesseract), .streamlit/config.toml, auto-seed +
+  fixture generation on startup; README deploy section; drop hardcoded local path
+- Bridge LLM credentials from Streamlit secrets into settings
+- Make pipeline stages honest: stages 14/15 now run and report real financial /
+  PO-balance outcomes instead of logging work done elsewhere
+
+Tier 1 (graded surface):
+- True live run view: orchestrator emits per-stage progress events; upload page
+  streams the 19 stages as they execute and ends with a reasoned decision card
+  (status, reasons, recommended action)
+- Price/quantity tolerance rules + tax-rate reasonableness: within tolerance
+  approves with a note, outside routes to review (previously approved silently)
+- Invoice details shows real per-field confidence and verbatim evidence snippets
+  instead of hard-coded 95%
+
+All 25 tests pass; 4 core scenarios unchanged (APPROVED/BLOCKED/BLOCKED/REVIEW).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PG4gH6f1r89tyoPZ22HZFm
+---
+ .gitignore                       |   5 +-
+ .streamlit/config.toml           |  14 ++
+ .streamlit/secrets.toml.example  |   6 +
+ README.md                        |  26 +++-
+ app/config/rules.py              |   8 +
+ app/decision/rules_engine.py     | 119 ++++++++++++++-
+ app/main.py                      |  54 ++++++-
+ app/processing/normalizer.py     |   2 +-
+ app/ui/invoice_details.py        |  83 ++++++++--
+ app/ui/upload.py                 | 251 ++++++++++++++++++++++---------
+ app/workflow/execution_logger.py |  34 ++++-
+ app/workflow/orchestrator.py     |  45 ++++--
+ packages.txt                     |   1 +
+ runtime.txt                      |   1 +
+ 14 files changed, 539 insertions(+), 110 deletions(-)
+ create mode 100644 .streamlit/config.toml
+ create mode 100644 .streamlit/secrets.toml.example
+ create mode 100644 packages.txt
+ create mode 100644 runtime.txt
+
+diff --git a/.gitignore b/.gitignore
+index aa4138b..89cb1b5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -33,8 +33,9 @@ htmlcov/
+ .tox/
+ .mypy_cache/
+ 
+-# Streamlit local state
+-.streamlit/
++# Streamlit local state (keep config.toml and secrets example tracked;
++# never commit real secrets)
++.streamlit/secrets.toml
+ .agents/
+ 
+ # OS / IDE specific
+diff --git a/.streamlit/config.toml b/.streamlit/config.toml
+new file mode 100644
+index 0000000..94cab32
+--- /dev/null
++++ b/.streamlit/config.toml
+@@ -0,0 +1,14 @@
++[theme]
++primaryColor = "#2B6CB0"
++backgroundColor = "#FFFFFF"
++secondaryBackgroundColor = "#F7FAFC"
++textColor = "#1A202C"
++font = "sans serif"
++
++[server]
++headless = true
++enableCORS = false
++enableXsrfProtection = true
++
++[browser]
++gatherUsageStats = false
+diff --git a/.streamlit/secrets.toml.example b/.streamlit/secrets.toml.example
+new file mode 100644
+index 0000000..9176be6
+--- /dev/null
++++ b/.streamlit/secrets.toml.example
+@@ -0,0 +1,6 @@
++# Copy to .streamlit/secrets.toml (local) or paste into the Streamlit Cloud
++# "Secrets" box for the deployed app. Leave blank to run the deterministic
++# demo extractor (no network calls). Provide a key to use live LLM extraction.
++LLM_API_KEY = ""
++LLM_BASE_URL = "https://api.openai.com/v1"
++LLM_MODEL = "gpt-4o-mini"
+diff --git a/README.md b/README.md
+index 94ebcc8..d4f2d10 100644
+--- a/README.md
++++ b/README.md
+@@ -121,12 +121,13 @@ The central `WorkflowOrchestrator` coordinates the end-to-end lifecycle of every
+ ## 4. Installation & Environment Setup
+ 
+ ### Prerequisites
+-- Python 3.10+ (tested on Python 3.14)
+-- (Optional) Tesseract OCR installed on the host system (`brew install tesseract` on macOS). If not installed, the engine gracefully utilizes the built-in OCR fallback without crashing.
++- Python 3.11 (pinned via `runtime.txt`; tested on 3.11–3.13).
++- (Optional) Tesseract OCR on the host (`brew install tesseract` on macOS, `apt-get install tesseract-ocr` on Debian/Ubuntu). If absent, the engine falls back gracefully without crashing. On Streamlit Community Cloud this is installed automatically via `packages.txt`.
+ 
+-### Step 1: Clone or Navigate to Directory
++### Step 1: Clone the Repository
+ ```bash
+-cd /Users/herr_ag98/.gemini/antigravity/scratch/ap_invoice_engine
++git clone https://github.com/gargarnav0708/ap_invoice_engine
++cd ap_invoice_engine
+ ```
+ 
+ ### Step 2: Install Dependencies
+@@ -164,7 +165,11 @@ TESSERACT_CMD=
+ 
+ ## 5. Database Initialization & Synthetic Fixtures
+ 
+-Initialize and seed the database with 5 vendors, 10 POs, and generate the 4 test scenario PDFs:
++The app **self-seeds on first launch**: on startup it creates the tables, seeds
++5 vendors and 10 POs if the database is empty, and generates the 4 benchmark
++invoice PDFs if they are missing. No manual step is required for a fresh deploy.
++
++To seed manually (e.g. for CLI testing):
+ 
+ ```bash
+ # 1. Initialize tables and seed procurement records
+@@ -185,6 +190,17 @@ PYTHONPATH=. streamlit run app/main.py
+ ```
+ Open your browser to: **`http://localhost:8501`**
+ 
++Upload an invoice (or use the **Quick Test Scenarios** tab). Each run streams
++its 19 stages live as they execute and ends with a reasoned **decision card**
++(status, the reasons behind it, and the recommended next action).
++
++### Deploy on Streamlit Community Cloud
++
++1. Push this repo to GitHub and point [share.streamlit.io](https://share.streamlit.io) at `app/main.py`.
++2. `packages.txt` installs Tesseract OCR and `runtime.txt` pins Python 3.11 automatically.
++3. (Optional) For live LLM extraction, open **App → Settings → Secrets** and paste the contents of `.streamlit/secrets.toml.example`, filling in `LLM_API_KEY`. Left blank, the app runs the deterministic demo extractor with no network calls.
++4. The database and sample fixtures are created automatically on first load.
++
+ ---
+ 
+ ## 7. Automated Test Suite
+diff --git a/app/config/rules.py b/app/config/rules.py
+index 28dc97c..1afc4d6 100644
+--- a/app/config/rules.py
++++ b/app/config/rules.py
+@@ -21,6 +21,12 @@ class MatchingConfig:
+     LINE_ITEM_DESCRIPTION_SIMILARITY_THRESHOLD: float = 0.65
+     LINE_ITEM_PRICE_TOLERANCE_PCT: float = 0.01  # 1% price tolerance
+ 
++    # Price/quantity variance tolerances (invoice line vs matched PO line).
++    # Within tolerance -> approve with an informational note.
++    # Outside tolerance -> flag for human review (soft failure).
++    LINE_ITEM_PRICE_REVIEW_PCT: float = 0.05        # >5% unit-price variance -> review
++    LINE_ITEM_QTY_OVERAGE_TOLERANCE_ABS: float = 0.001  # any qty billed over the PO line -> review
++
+ 
+ @dataclass
+ class FinancialValidationConfig:
+@@ -84,6 +90,8 @@ class DecisionPolicyConfig:
+         "RULE_LOW_EXTRACTION_CONFIDENCE",
+         "RULE_MISSING_CRITICAL_FIELD",
+         "RULE_LINE_ITEM_MISMATCH",
++        "RULE_LINE_ITEM_PRICE_VARIANCE",
++        "RULE_LINE_ITEM_QTY_OVERAGE",
+         "RULE_TAX_CALCULATION_DISCREPANCY",
+         "RULE_ARITHMETIC_DISCREPANCY",
+     )
+diff --git a/app/decision/rules_engine.py b/app/decision/rules_engine.py
+index cd4d8b1..2a2b682 100644
+--- a/app/decision/rules_engine.py
++++ b/app/decision/rules_engine.py
+@@ -29,10 +29,16 @@ class RulesEngine:
+         matched_po: Optional[PurchaseOrder],
+         po_status: str,
+         duplicate_check: DuplicateCheckResult,
+-        line_item_matches: List[LineItemMatch]
++        line_item_matches: List[LineItemMatch],
++        financial_results: Optional[List[RuleResult]] = None
+     ) -> List[RuleResult]:
+         """
+         Runs the full suite of AP validation rules.
++
++        ``financial_results`` may be supplied by the orchestrator when the
++        financial / PO-balance checks have already been executed (so the
++        pipeline's financial-validation stages report real outcomes without
++        running the validator twice). If omitted, they are computed here.
+         """
+         results: List[RuleResult] = []
+ 
+@@ -265,9 +271,33 @@ class RulesEngine:
+         # ======================================================================
+         # 5. Financial Validation & PO Balance Rules
+         # ======================================================================
+-        financial_results = self.financial_validator.validate(normalized, matched_po)
++        if financial_results is None:
++            financial_results = self.financial_validator.validate(normalized, matched_po)
+         results.extend(financial_results)
+ 
++        # Tax-rate reasonableness: tax should be a plausible fraction of subtotal.
++        tax_amt = normalized.tax_amount or 0.0
++        sub_amt = normalized.subtotal
++        if sub_amt and sub_amt > 0 and tax_amt > 0:
++            tax_rate = tax_amt / sub_amt
++            max_rate = rules_config.financial.MAX_REASONABLE_TAX_RATE_PCT
++            if tax_rate > max_rate:
++                results.append(
++                    RuleResult(
++                        rule_id="RULE_TAX_CALCULATION_DISCREPANCY",
++                        rule_name="Tax Rate Reasonableness",
++                        category="FINANCIAL",
++                        result=RuleStatus.WARN,
++                        severity=RuleSeverity.SOFT,
++                        expected_value=f"<= {max_rate*100:.0f}% of subtotal",
++                        actual_value=f"{tax_rate*100:.1f}%",
++                        explanation=(
++                            f"Declared tax (${tax_amt:.2f}) is {tax_rate*100:.1f}% of subtotal "
++                            f"(${sub_amt:.2f}), above the {max_rate*100:.0f}% reasonableness bound. Verify tax."
++                        )
++                    )
++                )
++
+         # ======================================================================
+         # 6. Line Item Validation Rules
+         # ======================================================================
+@@ -287,4 +317,89 @@ class RulesEngine:
+                     )
+                 )
+ 
++            # Price & quantity tolerance checks on matched lines.
++            price_review_pct = rules_config.matching.LINE_ITEM_PRICE_REVIEW_PCT
++            price_note_pct = rules_config.matching.LINE_ITEM_PRICE_TOLERANCE_PCT
++            qty_tol = rules_config.matching.LINE_ITEM_QTY_OVERAGE_TOLERANCE_ABS
++            price_review_lines = []
++            qty_over_lines = []
++
++            for m in line_item_matches:
++                if m.po_line_id is None:
++                    continue
++                inv_item = (
++                    normalized.line_items[m.invoice_line_idx]
++                    if 0 <= m.invoice_line_idx < len(normalized.line_items) else None
++                )
++
++                # Unit-price variance (invoice line vs PO line).
++                if m.price_diff is not None and inv_item is not None:
++                    po_unit_price = round(inv_item.unit_price - m.price_diff, 2)
++                    if po_unit_price > 0:
++                        var_pct = abs(m.price_diff) / po_unit_price
++                        line_ref = m.po_line_number or (m.invoice_line_idx + 1)
++                        if var_pct > price_review_pct:
++                            price_review_lines.append(
++                                f"line {line_ref}: ${po_unit_price:.2f} PO vs "
++                                f"${inv_item.unit_price:.2f} invoiced ({var_pct*100:.1f}%)"
++                            )
++                        elif var_pct > price_note_pct:
++                            results.append(
++                                RuleResult(
++                                    rule_id="RULE_LINE_ITEM_PRICE_VARIANCE",
++                                    rule_name="Line Item Price Within Tolerance",
++                                    category="LINE_ITEM",
++                                    result=RuleStatus.PASS,
++                                    severity=RuleSeverity.INFO,
++                                    expected_value=f"${po_unit_price:.2f} (PO)",
++                                    actual_value=f"${inv_item.unit_price:.2f}",
++                                    difference=f"{var_pct*100:.1f}%",
++                                    explanation=(
++                                        f"Line {line_ref} unit price varies {var_pct*100:.1f}% from PO, "
++                                        f"within the {price_review_pct*100:.0f}% review tolerance. Approved with note."
++                                    )
++                                )
++                            )
++
++                # Quantity overage (invoice billed more units than the PO line).
++                if m.qty_diff is not None and m.qty_diff > qty_tol:
++                    line_ref = m.po_line_number or (m.invoice_line_idx + 1)
++                    qty_over_lines.append(f"line {line_ref}: +{m.qty_diff:g} over PO")
++
++            if price_review_lines:
++                results.append(
++                    RuleResult(
++                        rule_id="RULE_LINE_ITEM_PRICE_VARIANCE",
++                        rule_name="Line Item Price Variance Exceeds Tolerance",
++                        category="LINE_ITEM",
++                        result=RuleStatus.WARN,
++                        severity=RuleSeverity.SOFT,
++                        expected_value=f"<= {price_review_pct*100:.0f}% vs PO unit price",
++                        actual_value=f"{len(price_review_lines)} line(s) over tolerance",
++                        explanation=(
++                            "Unit price exceeds PO beyond tolerance on "
++                            + "; ".join(price_review_lines)
++                            + ". Human review required."
++                        )
++                    )
++                )
++
++            if qty_over_lines:
++                results.append(
++                    RuleResult(
++                        rule_id="RULE_LINE_ITEM_QTY_OVERAGE",
++                        rule_name="Line Item Quantity Overage",
++                        category="LINE_ITEM",
++                        result=RuleStatus.WARN,
++                        severity=RuleSeverity.SOFT,
++                        expected_value="Invoiced qty <= PO qty",
++                        actual_value=f"{len(qty_over_lines)} line(s) over PO",
++                        explanation=(
++                            "Invoiced quantity exceeds the PO on "
++                            + "; ".join(qty_over_lines)
++                            + ". Human review required."
++                        )
++                    )
++                )
++
+         return results
+diff --git a/app/main.py b/app/main.py
+index 889906c..3916c1e 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -5,6 +5,7 @@ Main Streamlit application entry point.
+ import streamlit as st
+ from app.config.settings import settings
+ from app.database.db import init_db, get_db
++from app.utils.logging import get_logger
+ from app.ui.dashboard import render_dashboard
+ from app.ui.upload import render_upload
+ from app.ui.processing_view import render_processing_view
+@@ -12,6 +13,8 @@ from app.ui.invoice_history import render_invoice_history
+ from app.ui.invoice_details import render_invoice_details
+ from app.ui.settings_view import render_settings
+ 
++logger = get_logger("main")
++
+ # Configure page layout and title
+ st.set_page_config(
+     page_title="Zamp AP Automation & Decision Engine",
+@@ -20,8 +23,55 @@ st.set_page_config(
+     initial_sidebar_state="expanded"
+ )
+ 
+-# Initialize database tables on startup
+-init_db()
++
++def _apply_secrets() -> None:
++    """Bridge Streamlit secrets (used on Streamlit Community Cloud) into the
++    settings object so a deployed app can use live LLM extraction without a
++    committed .env. Env vars still take priority when already set."""
++    try:
++        secrets = st.secrets
++    except Exception:
++        return
++    for key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
++        try:
++            val = secrets.get(key) if hasattr(secrets, "get") else secrets[key]
++        except Exception:
++            val = None
++        if val:
++            setattr(settings, key, str(val))
++
++
++@st.cache_resource
++def _bootstrap() -> bool:
++    """One-time startup: create tables, seed procurement data, and generate the
++    sample invoice fixtures if they are missing. Cached so it runs once per
++    server process (safe for a fresh container on Streamlit Cloud)."""
++    init_db()
++    try:
++        from app.database.db import get_db
++        from app.database.entities import Vendor
++        with get_db() as session:
++            vendor_count = session.query(Vendor).count()
++        if vendor_count == 0:
++            from scripts.seed_database import seed
++            seed()
++            logger.info("Bootstrap: seeded procurement database.")
++    except Exception as e:
++        logger.error(f"Bootstrap seeding failed: {e}")
++
++    try:
++        sample = settings.SAMPLE_DATA_DIR / "scenario_1_clean_invoice.pdf"
++        if not sample.exists():
++            from scripts.generate_test_invoices import generate_all_scenarios
++            generate_all_scenarios()
++            logger.info("Bootstrap: generated sample invoice fixtures.")
++    except Exception as e:
++        logger.error(f"Bootstrap fixture generation failed: {e}")
++    return True
++
++
++_apply_secrets()
++_bootstrap()
+ 
+ 
+ def main():
+diff --git a/app/processing/normalizer.py b/app/processing/normalizer.py
+index d02e369..723bf21 100644
+--- a/app/processing/normalizer.py
++++ b/app/processing/normalizer.py
+@@ -2,7 +2,7 @@
+ Data normalisation functions for financial values, vendor names, dates, currencies, and identifiers.
+ """
+ import re
+-from typing import Optional
++from typing import Optional, Any
+ from datetime import datetime
+ from dateutil import parser as date_parser
+ 
+diff --git a/app/ui/invoice_details.py b/app/ui/invoice_details.py
+index fb314a4..871f3bf 100644
+--- a/app/ui/invoice_details.py
++++ b/app/ui/invoice_details.py
+@@ -84,19 +84,78 @@ def render_invoice_details(session: Session):
+ 
+     with col_fields:
+         st.subheader("Extracted Structured Fields")
+-        fields_data = [
+-            {"Field": "Vendor Name", "Value": invoice.vendor.legal_name if invoice.vendor else "Unmatched", "Confidence": f"{invoice.extraction_confidence*100:.0f}%"},
+-            {"Field": "Invoice Number", "Value": invoice.invoice_number or "N/A", "Confidence": "95%"},
+-            {"Field": "Invoice Date", "Value": invoice.invoice_date or "N/A", "Confidence": "95%"},
+-            {"Field": "Payment Due Date", "Value": invoice.due_date or "N/A", "Confidence": "90%"},
+-            {"Field": "PO Reference", "Value": invoice.po_reference or "N/A", "Confidence": "95%"},
+-            {"Field": "Currency", "Value": invoice.currency or "USD", "Confidence": "95%"},
+-            {"Field": "Subtotal", "Value": f"${invoice.subtotal:.2f}" if invoice.subtotal is not None else "N/A", "Confidence": "95%"},
+-            {"Field": "Tax Amount", "Value": f"${invoice.tax_amount:.2f}" if invoice.tax_amount is not None else "N/A", "Confidence": "95%"},
+-            {"Field": "Total Amount", "Value": f"${invoice.total_amount:.2f}" if invoice.total_amount is not None else "N/A", "Confidence": "95%"},
+-            {"Field": "SHA-256 Hash", "Value": invoice.file_hash[:16] + "...", "Confidence": "100%"},
++
++        # Parse the persisted extraction payload for real per-field confidence
++        # and the verbatim evidence snippet each value was taken from.
++        extracted = {}
++        try:
++            extracted = json.loads(invoice.extracted_data) if invoice.extracted_data else {}
++        except Exception:
++            extracted = {}
++
++        def fld(key: str):
++            """Returns (value, confidence_pct_str, evidence) for an extracted field."""
++            obj = extracted.get(key) if isinstance(extracted, dict) else None
++            if isinstance(obj, dict):
++                conf = obj.get("confidence")
++                conf_str = f"{conf*100:.0f}%" if isinstance(conf, (int, float)) else "—"
++                ev = obj.get("evidence") or "—"
++                return obj.get("value"), conf_str, ev
++            return None, "—", "—"
++
++        provider_note = "Demo / rule-based extractor" if extracted.get("is_mock", True) else "LLM extractor"
++        st.caption(f"Confidence and evidence are reported per field by the {provider_note}.")
++
++        field_specs = [
++            ("Vendor Name", "vendor_name", None),
++            ("Invoice Number", "invoice_number", None),
++            ("Invoice Date", "invoice_date", None),
++            ("Payment Due Date", "due_date", None),
++            ("PO Reference", "po_reference", None),
++            ("Currency", "currency", None),
++            ("Tax ID", "vendor_tax_id", None),
++            ("Subtotal", "subtotal", "money"),
++            ("Tax Amount", "tax_amount", "money"),
++            ("Total Amount", "total_amount", "money"),
+         ]
+-        st.table(pd.DataFrame(fields_data))
++
++        fields_data = []
++        for label, key, kind in field_specs:
++            value, conf_str, ev = fld(key)
++            if value is None:
++                shown = "— (not found)"
++            elif kind == "money":
++                try:
++                    shown = f"${float(value):,.2f}"
++                except (TypeError, ValueError):
++                    shown = str(value)
++            else:
++                shown = str(value)
++            ev_short = ev if len(str(ev)) <= 48 else str(ev)[:45] + "…"
++            fields_data.append(
++                {"Field": label, "Value": shown, "Confidence": conf_str, "Evidence": ev_short}
++            )
++
++        fields_data.append(
++            {"Field": "SHA-256 Hash", "Value": invoice.file_hash[:16] + "…",
++             "Confidence": "100%", "Evidence": "binary file hash"}
++        )
++
++        st.dataframe(
++            pd.DataFrame(fields_data),
++            use_container_width=True,
++            hide_index=True,
++            column_config={
++                "Confidence": st.column_config.TextColumn(
++                    "Conf.", help="Per-field extraction confidence (lower = more likely to need review)"
++                ),
++                "Evidence": st.column_config.TextColumn(
++                    "Evidence", help="Verbatim snippet the value was extracted from"
++                ),
++            },
++        )
++        if extracted.get("overall_confidence") is not None:
++            st.caption(f"Overall extraction confidence: **{extracted['overall_confidence']*100:.0f}%**")
+ 
+     st.markdown("---")
+ 
+diff --git a/app/ui/upload.py b/app/ui/upload.py
+index 565c169..a388a13 100644
+--- a/app/ui/upload.py
++++ b/app/ui/upload.py
+@@ -1,5 +1,7 @@
+ """
+-Streamlit Invoice Upload View: Drag-and-drop file upload and 1-click test scenario runners.
++Streamlit Invoice Upload View: Drag-and-drop file upload and 1-click test scenario
++runners, with a true live run view (each of the 19 stages ticking over as it
++executes) and a final decision card showing the reasoned outcome.
+ """
+ from pathlib import Path
+ import streamlit as st
+@@ -7,6 +9,38 @@ from sqlalchemy.orm import Session
+ 
+ from app.config.settings import settings
+ from app.workflow.orchestrator import WorkflowOrchestrator
++from app.core.schemas import DecisionStatus
++
++
++# Canonical ordered list of the 19 pipeline stages, shown greyed-out before they run.
++PIPELINE_STAGES = [
++    "1. Receive invoice",
++    "2. Validate uploaded file",
++    "3. Calculate file hash",
++    "4. Check for exact duplicate",
++    "5. Extract PDF text",
++    "6. Run OCR when necessary",
++    "7. Extract structured invoice information",
++    "8. Validate extracted schema",
++    "9. Normalise extracted fields",
++    "10. Match vendor",
++    "11. Match purchase order",
++    "12. Detect duplicate invoices",
++    "13. Match line items",
++    "14. Run financial validation",
++    "15. Run PO balance validation",
++    "16. Generate final decision",
++    "17. Save all results",
++    "18. Update invoice and PO records",
++    "19. Generate the final audit report",
++]
++
++_STATUS_ICON = {
++    "PENDING": "⚪",
++    "RUNNING": "⏳",
++    "COMPLETED": "✅",
++    "FAILED": "❌",
++}
+ 
+ 
+ def render_upload(session: Session):
+@@ -30,84 +64,155 @@ def render_upload(session: Session):
+                 st.write(f"**File Size:** `{len(uploaded_file.getvalue()) / 1024:.1f} KB`")
+ 
+             if st.button("🚀 Process Invoice Now", type="primary", use_container_width=True):
+-                with st.spinner("Processing invoice through 19-stage pipeline..."):
+-                    try:
+-                        file_bytes = uploaded_file.getvalue()
+-                        inv_entity, run_entity = orchestrator.process_invoice(
+-                            file_bytes=file_bytes,
+-                            original_filename=uploaded_file.name
+-                        )
+-                        st.session_state["selected_invoice_id"] = inv_entity.id
+-                        st.session_state["latest_run_id"] = run_entity.id
+-                        st.success(f"Processing Complete! Decision: **{inv_entity.final_decision}**")
+-                        st.info("Navigate to 'Live Processing View' or 'Invoice Details' to inspect the audit trail.")
+-                    except Exception as e:
+-                        st.error(f"Processing failed: {e}")
++                _run_with_live_view(
++                    orchestrator,
++                    file_bytes=uploaded_file.getvalue(),
++                    filename=uploaded_file.name,
++                    title=uploaded_file.name,
++                )
+ 
+     with tab_scenarios:
+         st.subheader("Run Verified Case Study Scenarios")
+         st.write("Demonstrate the core AP engine capabilities on synthetic benchmark fixtures:")
+ 
++        scenarios = [
++            ("Scenario 1: Clean Invoice",
++             "Approved vendor ('Acme Industrial Supplies'), valid PO ('PO-2026-001'), matching line items and math.",
++             "APPROVED", "scenario_1_clean_invoice.pdf", "btn_s1"),
++            ("Scenario 2: Duplicate Invoice",
++             "Re-submission of the identical clean invoice file / invoice number.",
++             "BLOCKED (Confirmed Duplicate)", "scenario_2_duplicate_invoice.pdf", "btn_s2"),
++            ("Scenario 3: Split PO Overbilling",
++             "PO-2026-002 has only $500 remaining balance. Invoice bills $1,100, exceeding available balance.",
++             "BLOCKED (PO Balance Exceeded)", "scenario_3_split_overbilling.pdf", "btn_s3"),
++            ("Scenario 4: Incomplete / Unreadable Invoice",
++             "Document missing invoice number, PO reference, and clear tax arithmetic.",
++             "NEEDS_REVIEW (Missing Critical Fields)", "scenario_4_incomplete_invoice.pdf", "btn_s4"),
++        ]
++
+         col1, col2 = st.columns(2)
++        for idx, (name, desc, expected, filename, key) in enumerate(scenarios):
++            target = col1 if idx % 2 == 0 else col2
++            with target:
++                st.markdown(f"### {name}")
++                st.caption(desc)
++                st.caption(f"🎯 **Expected Outcome:** `{expected}`")
++                if st.button(f"▶ Run {name.split(':')[0]}", key=key, use_container_width=True):
++                    st.session_state["_pending_scenario"] = (filename, name)
++                st.markdown("---")
++
++    # Run a queued scenario below the grid so the live view spans full width.
++    pending = st.session_state.pop("_pending_scenario", None)
++    if pending:
++        filename, name = pending
++        file_path = settings.SAMPLE_DATA_DIR / filename
++        if not file_path.exists():
++            st.error(f"Sample fixture not found at {file_path}. Run generate_test_invoices.py first.")
++        else:
++            _run_with_live_view(
++                orchestrator,
++                file_bytes=file_path.read_bytes(),
++                filename=filename,
++                title=name,
++            )
+ 
+-        with col1:
+-            st.markdown("### Scenario 1: Clean Invoice")
+-            st.caption("Approved vendor ('Acme Industrial Supplies'), valid PO ('PO-2026-001'), matching line items and math.")
+-            st.caption("🎯 **Expected Outcome:** `APPROVED`")
+-            if st.button("▶ Run Scenario 1", key="btn_s1", use_container_width=True):
+-                s1_file = settings.SAMPLE_DATA_DIR / "scenario_1_clean_invoice.pdf"
+-                _run_file_scenario(orchestrator, s1_file, "Scenario 1: Clean Invoice")
+-
+-            st.markdown("---")
+-
+-            st.markdown("### Scenario 3: Split PO Overbilling")
+-            st.caption("PO-2026-002 has only $500 remaining balance. Invoice bills $1,100, exceeding available balance.")
+-            st.caption("🎯 **Expected Outcome:** `BLOCKED` (PO Balance Exceeded)")
+-            if st.button("▶ Run Scenario 3", key="btn_s3", use_container_width=True):
+-                s3_file = settings.SAMPLE_DATA_DIR / "scenario_3_split_overbilling.pdf"
+-                _run_file_scenario(orchestrator, s3_file, "Scenario 3: Split Overbilling")
+-
+-        with col2:
+-            st.markdown("### Scenario 2: Duplicate Invoice")
+-            st.caption("Re-submission of the identical clean invoice file / invoice number.")
+-            st.caption("🎯 **Expected Outcome:** `BLOCKED` (Confirmed Duplicate)")
+-            if st.button("▶ Run Scenario 2", key="btn_s2", use_container_width=True):
+-                s2_file = settings.SAMPLE_DATA_DIR / "scenario_2_duplicate_invoice.pdf"
+-                _run_file_scenario(orchestrator, s2_file, "Scenario 2: Duplicate Invoice")
+-
+-            st.markdown("---")
+-
+-            st.markdown("### Scenario 4: Incomplete / Unreadable Invoice")
+-            st.caption("Document missing invoice number, PO reference, and clear tax arithmetic.")
+-            st.caption("🎯 **Expected Outcome:** `NEEDS_REVIEW` (Missing Critical Fields)")
+-            if st.button("▶ Run Scenario 4", key="btn_s4", use_container_width=True):
+-                s4_file = settings.SAMPLE_DATA_DIR / "scenario_4_incomplete_invoice.pdf"
+-                _run_file_scenario(orchestrator, s4_file, "Scenario 4: Incomplete Invoice")
+-
+-
+-def _run_file_scenario(orchestrator: WorkflowOrchestrator, file_path: Path, title: str):
+-    if not file_path.exists():
+-        st.error(f"Sample fixture not found at {file_path}. Run generate_test_invoices.py first.")
++
++def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, filename: str, title: str):
++    """Executes the pipeline while streaming each stage into a live view, then
++    renders the final reasoned decision card."""
++    st.markdown(f"### ⚙️ Live Run — {title}")
++    stage_placeholder = st.empty()
++
++    # Stage state and ordering (local copies so runs never mutate module globals).
++    stages_order = list(PIPELINE_STAGES)
++    stage_state = {name: {"status": "PENDING", "details": None, "duration_ms": None}
++                   for name in stages_order}
++
++    def render():
++        lines = []
++        for name in stages_order:
++            s = stage_state[name]
++            icon = _STATUS_ICON.get(s["status"], "⚪")
++            line = f"{icon} **{name}**"
++            if s["status"] == "COMPLETED" and s["duration_ms"] is not None:
++                line += f"  ·  _{s['duration_ms']:.0f} ms_"
++            lines.append(line)
++            if s["details"] and s["status"] in ("COMPLETED", "FAILED"):
++                lines.append(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {s['details']}")
++        stage_placeholder.markdown("\n\n".join(lines))
++
++    def on_event(event: dict):
++        name = event.get("stage_name")
++        if name not in stage_state:
++            # Unknown label — append it so nothing is silently dropped.
++            stage_state[name] = {"status": "PENDING", "details": None, "duration_ms": None}
++            stages_order.append(name)
++        if event["type"] == "start":
++            stage_state[name]["status"] = "RUNNING"
++        elif event["type"] == "complete":
++            stage_state[name]["status"] = "COMPLETED"
++            stage_state[name]["details"] = event.get("details")
++            stage_state[name]["duration_ms"] = event.get("duration_ms")
++        elif event["type"] == "fail":
++            stage_state[name]["status"] = "FAILED"
++            stage_state[name]["details"] = event.get("error")
++            stage_state[name]["duration_ms"] = event.get("duration_ms")
++        render()
++
++    render()  # initial all-pending render
++    try:
++        inv_entity, run_entity = orchestrator.process_invoice(
++            file_bytes=file_bytes,
++            original_filename=filename,
++            progress_callback=on_event,
++        )
++    except Exception as e:
++        st.error(f"Processing failed: {e}")
+         return
+ 
+-    with st.spinner(f"Executing {title}..."):
+-        try:
+-            with open(file_path, "rb") as f:
+-                data = f.read()
+-            inv_entity, run_entity = orchestrator.process_invoice(
+-                file_bytes=data,
+-                original_filename=file_path.name
+-            )
+-            st.session_state["selected_invoice_id"] = inv_entity.id
+-            st.session_state["latest_run_id"] = run_entity.id
+-
+-            decision_color = {
+-                "APPROVED": "green",
+-                "NEEDS_REVIEW": "orange",
+-                "BLOCKED": "red"
+-            }.get(inv_entity.final_decision, "blue")
+-
+-            st.markdown(f"#### Result: :{decision_color}[{inv_entity.final_decision}]")
+-            st.success(f"Processing completed for {file_path.name} (Invoice ID: {inv_entity.id})")
+-        except Exception as e:
+-            st.error(f"Execution failed: {e}")
++    st.session_state["selected_invoice_id"] = inv_entity.id
++    st.session_state["latest_run_id"] = run_entity.id
++
++    _render_decision_card(inv_entity, run_entity)
++
++
++def _render_decision_card(inv_entity, run_entity):
++    """Renders the final reasoned decision with reasons and the recommended next action."""
++    decision = getattr(run_entity, "decision_result", None)
++    status = inv_entity.final_decision
++
++    st.markdown("### Decision")
++    palette = {
++        "APPROVED": ("green", "🟢"),
++        "NEEDS_REVIEW": ("orange", "🟠"),
++        "BLOCKED": ("red", "🔴"),
++    }
++    color, emoji = palette.get(status, ("blue", "🔵"))
++
++    st.markdown(f"## {emoji} :{color}[{status}]")
++    if decision is not None:
++        st.write(decision.summary)
++
++    col_a, col_b, col_c = st.columns(3)
++    col_a.metric("Decision", status)
++    col_b.metric("Extraction Confidence", f"{(inv_entity.extraction_confidence or 0)*100:.0f}%")
++    col_c.metric("Processing Time", f"{run_entity.duration_ms:.0f} ms" if run_entity.duration_ms else "—")
++
++    if decision is not None:
++        if decision.checks_failed:
++            st.markdown("#### Why")
++            for item in decision.checks_failed:
++                st.markdown(f"- ❌ {item}")
++        if decision.warnings:
++            st.markdown("#### Flags")
++            for item in decision.warnings:
++                st.markdown(f"- ⚠️ {item}")
++        st.info(f"**Recommended action:** {decision.recommended_action}")
++        with st.expander(f"All checks ({len(decision.checks_passed)} passed)", expanded=False):
++            for item in decision.checks_passed:
++                st.markdown(f"- ✅ {item}")
++
++    st.success(
++        f"Invoice #{inv_entity.id} processed. "
++        "Open **Invoice Details** for the full audit workbench, or **Live Processing View** for the saved stage trace."
++    )
+diff --git a/app/workflow/execution_logger.py b/app/workflow/execution_logger.py
+index 6a5712c..c2c888b 100644
+--- a/app/workflow/execution_logger.py
++++ b/app/workflow/execution_logger.py
+@@ -3,33 +3,50 @@ Execution logger for tracking workflow stage progression, durations, and statuse
+ """
+ from datetime import datetime, timezone
+ import time
+-from typing import List, Optional
++from typing import List, Optional, Callable
+ import json
+ 
+ from app.core.schemas import StageStatus, StageExecutionRecord
+ 
+ 
+ class ExecutionLogger:
+-    def __init__(self):
++    def __init__(self, on_event: Optional[Callable[[dict], None]] = None):
++        """
++        ``on_event`` is an optional callback fired whenever a stage starts,
++        completes, or fails. It receives a small dict describing the event so a
++        UI can render the pipeline live as it runs. Exceptions raised by the
++        callback are swallowed so instrumentation never breaks a run.
++        """
+         self.records: List[StageExecutionRecord] = []
+         self._current_stage_name: Optional[str] = None
+         self._stage_start_perf: Optional[float] = None
+         self._stage_start_dt: Optional[str] = None
++        self._on_event = on_event
++
++    def _emit(self, event: dict) -> None:
++        if not self._on_event:
++            return
++        try:
++            self._on_event(event)
++        except Exception:
++            pass
+ 
+     def start_stage(self, stage_name: str) -> None:
+         """Marks a stage as started."""
+         self._current_stage_name = stage_name
+         self._stage_start_perf = time.perf_counter()
+         self._stage_start_dt = datetime.now(timezone.utc).isoformat()
++        self._emit({"type": "start", "stage_name": stage_name})
+ 
+     def complete_stage(self, details: Optional[str] = None) -> None:
+         """Marks the current stage as completed."""
+         if not self._current_stage_name:
+             return
+         duration_ms = (time.perf_counter() - self._stage_start_perf) * 1000.0 if self._stage_start_perf else 0.0
++        stage_name = self._current_stage_name
+         self.records.append(
+             StageExecutionRecord(
+-                stage_name=self._current_stage_name,
++                stage_name=stage_name,
+                 status=StageStatus.COMPLETED,
+                 start_time=self._stage_start_dt or datetime.now(timezone.utc).isoformat(),
+                 completion_time=datetime.now(timezone.utc).isoformat(),
+@@ -38,15 +55,20 @@ class ExecutionLogger:
+             )
+         )
+         self._current_stage_name = None
++        self._emit({
++            "type": "complete", "stage_name": stage_name,
++            "details": details, "duration_ms": round(duration_ms, 2)
++        })
+ 
+     def fail_stage(self, error_message: str) -> None:
+         """Marks the current stage as failed."""
+         if not self._current_stage_name:
+             return
+         duration_ms = (time.perf_counter() - self._stage_start_perf) * 1000.0 if self._stage_start_perf else 0.0
++        stage_name = self._current_stage_name
+         self.records.append(
+             StageExecutionRecord(
+-                stage_name=self._current_stage_name,
++                stage_name=stage_name,
+                 status=StageStatus.FAILED,
+                 start_time=self._stage_start_dt or datetime.now(timezone.utc).isoformat(),
+                 completion_time=datetime.now(timezone.utc).isoformat(),
+@@ -55,6 +77,10 @@ class ExecutionLogger:
+             )
+         )
+         self._current_stage_name = None
++        self._emit({
++            "type": "fail", "stage_name": stage_name,
++            "error": error_message, "duration_ms": round(duration_ms, 2)
++        })
+ 
+     def skip_stage(self, stage_name: str, reason: str) -> None:
+         """Records a skipped stage."""
+diff --git a/app/workflow/orchestrator.py b/app/workflow/orchestrator.py
+index a2d31a7..a27b1ee 100644
+--- a/app/workflow/orchestrator.py
++++ b/app/workflow/orchestrator.py
+@@ -3,7 +3,7 @@ Central Workflow Orchestrator coordinating all 19 processing stages for AP invoi
+ Supports atomic transactions, idempotent reruns, and human overrides.
+ """
+ from pathlib import Path
+-from typing import Optional, Tuple, Dict, Any
++from typing import Optional, Tuple, Dict, Any, Callable
+ from datetime import datetime, timezone
+ import time
+ import json
+@@ -61,12 +61,18 @@ class WorkflowOrchestrator:
+         file_bytes: Optional[bytes] = None,
+         original_filename: str = "invoice.pdf",
+         existing_file_path: Optional[Path] = None,
+-        existing_invoice_id: Optional[int] = None
++        existing_invoice_id: Optional[int] = None,
++        progress_callback: Optional[Callable[[dict], None]] = None
+     ) -> Tuple[Invoice, ProcessingRun]:
+         """
+         Executes the end-to-end 19-stage AP invoice processing workflow.
++
++        ``progress_callback`` is an optional function that receives a dict for
++        every stage start / completion / failure, enabling a live run view.
++        The resulting ``ProcessingRun`` carries the computed ``DecisionResult``
++        on a transient ``decision_result`` attribute for the caller to render.
+         """
+-        exec_logger = ExecutionLogger()
++        exec_logger = ExecutionLogger(on_event=progress_callback)
+         start_time_perf = time.perf_counter()
+         start_time_dt = datetime.now(timezone.utc)
+ 
+@@ -200,14 +206,32 @@ class WorkflowOrchestrator:
+             line_item_matches = self.line_matcher.match_line_items(normalized, matched_po)
+             exec_logger.complete_stage(f"Matched {len(line_item_matches)} line items to PO lines.")
+ 
+-            # Stage 14: Run financial validation & Stage 15: Run PO balance validation
++            # Stage 14: Run financial validation (arithmetic, subtotal, tax, currency)
+             exec_logger.start_stage("14. Run financial validation")
+-            # Evaluated as part of rules engine
+-            exec_logger.complete_stage("Arithmetic, subtotal, and tax consistency validated.")
++            financial_results = self.rules_engine.financial_validator.validate(normalized, matched_po)
++            fin_fails = [r for r in financial_results
++                         if r.category == "FINANCIAL" and r.result == RuleStatus.FAIL]
++            fin_checks = [r for r in financial_results if r.category == "FINANCIAL"]
++            if fin_fails:
++                exec_logger.complete_stage(
++                    f"{len(fin_checks)} financial check(s): {len(fin_fails)} failed — "
++                    + "; ".join(r.rule_name for r in fin_fails)
++                )
++            else:
++                exec_logger.complete_stage(
++                    f"{len(fin_checks)} financial check(s) passed (arithmetic, subtotal, tax, currency)."
++                )
+ 
++            # Stage 15: Run PO balance validation (cumulative billing vs remaining balance)
+             exec_logger.start_stage("15. Run PO balance validation")
+-            # Evaluated as part of rules engine
+-            exec_logger.complete_stage("PO balance and cumulative billing evaluated.")
++            balance_results = [r for r in financial_results if r.category == "BALANCE"]
++            balance_fail = next((r for r in balance_results if r.result == RuleStatus.FAIL), None)
++            if balance_fail:
++                exec_logger.complete_stage(f"PO balance check FAILED: {balance_fail.explanation}")
++            elif balance_results:
++                exec_logger.complete_stage(f"PO balance check passed: {balance_results[0].explanation}")
++            else:
++                exec_logger.complete_stage("No PO linked; balance check not applicable.")
+ 
+             # Stage 16: Generate final decision
+             exec_logger.start_stage("16. Generate final decision")
+@@ -219,7 +243,8 @@ class WorkflowOrchestrator:
+                 matched_po=matched_po,
+                 po_status=po_status,
+                 duplicate_check=dup_check,
+-                line_item_matches=line_item_matches
++                line_item_matches=line_item_matches,
++                financial_results=financial_results
+             )
+             decision = self.decision_service.determine_decision(validation_results)
+             exec_logger.complete_stage(f"Final Decision generated: {decision.status.value}")
+@@ -319,6 +344,8 @@ class WorkflowOrchestrator:
+             run_entity.stages_log = exec_logger.to_json()
+ 
+             self.session.commit()
++            # Transient attribute for the caller's live decision card (not persisted).
++            run_entity.decision_result = decision
+             logger.info(f"Processing run completed for invoice {invoice_entity.id} in {duration_total_ms:.1f}ms with decision {decision.status.value}")
+             return invoice_entity, run_entity
+ 
+diff --git a/packages.txt b/packages.txt
+new file mode 100644
+index 0000000..66f8b91
+--- /dev/null
++++ b/packages.txt
+@@ -0,0 +1 @@
++tesseract-ocr
+diff --git a/runtime.txt b/runtime.txt
+new file mode 100644
+index 0000000..67ebc4e
+--- /dev/null
++++ b/runtime.txt
+@@ -0,0 +1 @@
++python-3.11
+-- 
+2.43.0
+
