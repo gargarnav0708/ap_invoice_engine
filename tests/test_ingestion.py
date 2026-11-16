@@ -46,10 +46,10 @@ def test_classify_scanned_image_document(tmp_path):
 
 def test_ocr_engine_abstraction():
     engine = FallbackOCREngine()
-    assert engine.is_available() is True
+    assert engine.is_available() is False
     dummy_img = Image.new("RGB", (50, 50))
     res = engine.extract_text_from_image(dummy_img)
-    assert "OCR_FALLBACK" in res
+    assert res == ""
 
 
 def test_pdf_loader_ingestion():

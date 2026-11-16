@@ -6,6 +6,7 @@ import streamlit as st
 from app.config.settings import settings
 from app.database.db import init_db, get_db
 from app.utils.logging import get_logger
+from app.ingestion.ocr_engine import get_ocr_engine
 from app.ui.dashboard import render_dashboard
 from app.ui.upload import render_upload
 from app.ui.processing_view import render_processing_view
@@ -60,11 +61,9 @@ def _bootstrap() -> bool:
         logger.error(f"Bootstrap seeding failed: {e}")
 
     try:
-        sample = settings.SAMPLE_DATA_DIR / "scenario_1_clean_invoice.pdf"
-        if not sample.exists():
-            from scripts.generate_test_invoices import generate_all_scenarios
-            generate_all_scenarios()
-            logger.info("Bootstrap: generated sample invoice fixtures.")
+        from scripts.generate_test_invoices import ensure_scenario_fixtures
+        ensure_scenario_fixtures()
+        logger.info("Bootstrap: verified sample invoice fixtures.")
     except Exception as e:
         logger.error(f"Bootstrap fixture generation failed: {e}")
     return True
@@ -110,7 +109,9 @@ def main():
         else:
             st.info("🟡 **AI Extraction:** Demo / Rule Engine")
 
-        st.caption(f"DB: SQLite | OCR: {'Enabled' if settings.OCR_ENABLED else 'Disabled'}")
+        ocr_engine = get_ocr_engine()
+        ocr_status = "Tesseract ready" if ocr_engine.is_available() else "Unavailable"
+        st.caption(f"DB: SQLite | OCR: {ocr_status}")
 
     # Main Content Area
     with get_db() as session:

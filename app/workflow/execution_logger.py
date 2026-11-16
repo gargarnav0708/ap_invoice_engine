@@ -36,7 +36,10 @@ class ExecutionLogger:
         self._current_stage_name = stage_name
         self._stage_start_perf = time.perf_counter()
         self._stage_start_dt = datetime.now(timezone.utc).isoformat()
-        self._emit({"type": "start", "stage_name": stage_name})
+        self._emit({
+            "type": "start", "stage_name": stage_name,
+            "start_time": self._stage_start_dt,
+        })
 
     def complete_stage(self, details: Optional[str] = None) -> None:
         """Marks the current stage as completed."""

@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.config.settings import settings
 from app.core.exceptions import APException, IngestionError, WorkflowError
 from app.core.schemas import (
-    ExtractedInvoice, NormalizedInvoice, DecisionStatus, RuleStatus,
+    ExtractedInvoice, NormalizedInvoice, DecisionStatus, RuleStatus, RuleSeverity,
     RuleResult, LineItemMatch
 )
 from app.database.entities import (
@@ -22,7 +22,7 @@ from app.database.entities import (
 from app.database.repositories import (
     InvoiceRepository, VendorRepository, PORepository, AuditRepository
 )
-from app.utils.file_storage import save_uploaded_file, validate_pdf_bytes
+from app.utils.file_storage import save_uploaded_file, validate_document_bytes
 from app.utils.hashing import calculate_file_hash
 from app.ingestion.pdf_loader import PDFLoader
 from app.extraction.extractor import InvoiceExtractor
@@ -72,13 +72,44 @@ class WorkflowOrchestrator:
         The resulting ``ProcessingRun`` carries the computed ``DecisionResult``
         on a transient ``decision_result`` attribute for the caller to render.
         """
-        exec_logger = ExecutionLogger(on_event=progress_callback)
         start_time_perf = time.perf_counter()
         start_time_dt = datetime.now(timezone.utc)
 
         # Temporary placeholders before entity persistence
         invoice_entity: Optional[Invoice] = None
         run_entity: Optional[ProcessingRun] = None
+
+        def emit_stage_event(event: dict) -> None:
+            """Persist the visible run trace as it advances, then notify the UI."""
+            if run_entity is not None:
+                run_entity.current_stage = (
+                    "COMPLETED"
+                    if run_entity.execution_status == "SUCCESS"
+                    else event.get("stage_name", run_entity.current_stage)
+                )
+                stage_records = [record.model_dump() for record in exec_logger.records]
+                if event.get("type") == "start":
+                    stage_records.append({
+                        "stage_name": event.get("stage_name"),
+                        "status": "RUNNING",
+                        "start_time": event.get("start_time"),
+                        "completion_time": None,
+                        "duration_ms": 0.0,
+                        "details": None,
+                        "error": None,
+                    })
+                run_entity.stages_log = json.dumps(stage_records)
+                try:
+                    # Each saved run trace remains useful if the browser or app
+                    # stops before the invoice reaches its final decision.
+                    self.session.commit()
+                except Exception:
+                    self.session.rollback()
+                    logger.warning("Could not persist an intermediate processing-stage update.", exc_info=True)
+            if progress_callback:
+                progress_callback(event)
+
+        exec_logger = ExecutionLogger(on_event=emit_stage_event)
 
         try:
             # Stage 1: Receive invoice
@@ -91,14 +122,14 @@ class WorkflowOrchestrator:
             else:
                 raise IngestionError("No file bytes or file path provided to orchestrator.")
 
-            # Stage 2: Validate uploaded file
+            # Stage 2: Validate uploaded document
             exec_logger.start_stage("2. Validate uploaded file")
             if file_bytes:
-                validate_pdf_bytes(file_bytes, original_filename)
+                validate_document_bytes(file_bytes, original_filename)
                 file_path, safe_filename = save_uploaded_file(file_bytes, original_filename)
             else:
                 safe_filename = file_path.name
-            exec_logger.complete_stage(f"Validated PDF header and size. Stored at {file_path.name}")
+            exec_logger.complete_stage(f"Validated document format and size. Stored at {file_path.name}")
 
             # Stage 3: Calculate file hash
             exec_logger.start_stage("3. Calculate file hash")
@@ -149,20 +180,30 @@ class WorkflowOrchestrator:
                 f"Duplicate check: is_dup={dup_check.is_duplicate}, type={dup_check.duplicate_type}"
             )
 
-            # Stage 5: Extract PDF text & Stage 6: Run OCR when necessary
-            exec_logger.start_stage("5. Extract PDF text")
-            ingestion_res = self.pdf_loader.load_pdf(file_path)
+            # Stage 5: Extract document text & Stage 6: Run OCR when necessary
+            exec_logger.start_stage("5. Extract document text")
+            ingestion_res = self.pdf_loader.load_document(file_path)
             exec_logger.complete_stage(f"Extracted {len(ingestion_res.full_text)} chars across {ingestion_res.total_pages} page(s).")
 
             exec_logger.start_stage("6. Run OCR when necessary")
-            if ingestion_res.ocr_applied:
+            if ingestion_res.ocr_unavailable:
+                exec_logger.complete_stage(
+                    "OCR was needed but unavailable or returned no text on at least one scanned page; invoice will be routed to review."
+                )
+            elif ingestion_res.ocr_applied:
                 exec_logger.complete_stage("OCR engine engaged for scanned/low-text content.")
             else:
                 exec_logger.complete_stage("Machine-readable text sufficient. OCR bypassed.")
 
             # Stage 7: Extract structured invoice information
             exec_logger.start_stage("7. Extract structured invoice information")
-            extracted_data = self.extractor.llm_provider.extract_invoice(ingestion_res.full_text)
+            if ingestion_res.ocr_unavailable and not ingestion_res.full_text.strip():
+                # Never ask a model to infer invoice fields from an OCR placeholder
+                # or an empty document. Missing data will deterministically route
+                # the invoice to a reviewer.
+                extracted_data = ExtractedInvoice(raw_text="", document_type=ingestion_res.document_type)
+            else:
+                extracted_data = self.extractor.llm_provider.extract_invoice(ingestion_res.full_text)
             extracted_data.document_type = ingestion_res.document_type
             exec_logger.complete_stage(f"Extracted fields via {self.extractor.llm_provider.provider_name} (conf={extracted_data.overall_confidence:.2f})")
 
@@ -246,6 +287,17 @@ class WorkflowOrchestrator:
                 line_item_matches=line_item_matches,
                 financial_results=financial_results
             )
+            if ingestion_res.ocr_unavailable:
+                validation_results.append(RuleResult(
+                    rule_id="RULE_OCR_UNAVAILABLE",
+                    rule_name="Scanned Page OCR Availability",
+                    category="EXTRACTION",
+                    result=RuleStatus.FAIL,
+                    severity=RuleSeverity.SOFT,
+                    expected_value="Readable text for every scanned page",
+                    actual_value="OCR unavailable or returned no text",
+                    explanation="At least one scanned page could not be transcribed. Review the source PDF before approving."
+                ))
             decision = self.decision_service.determine_decision(validation_results)
             exec_logger.complete_stage(f"Final Decision generated: {decision.status.value}")
 
@@ -263,8 +315,11 @@ class WorkflowOrchestrator:
             invoice_entity.total_amount = normalized.total_amount
             invoice_entity.extracted_data = extracted_data.model_dump_json()
             invoice_entity.extraction_confidence = extracted_data.overall_confidence
-            invoice_entity.processing_status = "COMPLETED"
-            invoice_entity.final_decision = decision.status.value
+            # Keep the invoice provisional until its PO balance is reserved at
+            # Stage 18. This prevents a saved APPROVED state without a matching
+            # financial reservation if the process stops between stages.
+            invoice_entity.processing_status = "PROCESSING"
+            invoice_entity.final_decision = DecisionStatus.NEEDS_REVIEW.value
 
             # Save line items
             self.session.query(InvoiceLineItem).filter(InvoiceLineItem.invoice_id == invoice_entity.id).delete()
@@ -305,6 +360,46 @@ class WorkflowOrchestrator:
 
             # Stage 18: Update invoice and PO records as appropriate
             exec_logger.start_stage("18. Update invoice and PO records")
+            late_duplicate = None
+            if decision.status == DecisionStatus.APPROVED and matched_vendor:
+                # Stage 17 commits the candidate invoice before the financial
+                # reservation. Recheck here so a concurrent submission with the
+                # same file or vendor invoice number cannot also be approved.
+                late_duplicate = self.duplicate_detector.check_duplicate(
+                    file_hash=file_hash,
+                    invoice=normalized,
+                    vendor_id=matched_vendor.id,
+                    current_invoice_id=invoice_entity.id
+                )
+                if late_duplicate.is_duplicate and late_duplicate.severity == "CONFIRMED":
+                    duplicate_rule = RuleResult(
+                        rule_id="RULE_CONFIRMED_DUPLICATE",
+                        rule_name="Confirmed Duplicate Invoice Check",
+                        category="DUPLICATE",
+                        result=RuleStatus.FAIL,
+                        severity=RuleSeverity.HARD,
+                        expected_value="Unique vendor invoice submission",
+                        actual_value=f"Duplicate of Invoice ID {late_duplicate.matched_invoice_id}",
+                        explanation=late_duplicate.explanation
+                    )
+                    validation_results.append(duplicate_rule)
+                    decision = self.decision_service.determine_decision(validation_results)
+                    invoice_entity.final_decision = decision.status.value
+                    self.session.add(ValidationResultEntity(
+                        invoice_id=invoice_entity.id,
+                        run_id=run_entity.id,
+                        rule_id=duplicate_rule.rule_id,
+                        rule_name=duplicate_rule.rule_name,
+                        category=duplicate_rule.category,
+                        result=duplicate_rule.result.value,
+                        severity=duplicate_rule.severity.value,
+                        expected_value=duplicate_rule.expected_value,
+                        actual_value=duplicate_rule.actual_value,
+                        difference=duplicate_rule.difference,
+                        explanation=duplicate_rule.explanation,
+                        evidence=duplicate_rule.evidence
+                    ))
+
             # If the invoice is AUTOMATICALLY APPROVED, atomically update PO billed balance
             if decision.status == DecisionStatus.APPROVED and matched_po and normalized.total_amount:
                 success, err = self.po_repo.update_billed_balance_atomic(
@@ -317,9 +412,44 @@ class WorkflowOrchestrator:
                         f"Updated PO {matched_po.po_number}: Billed +${normalized.total_amount:.2f}, Rem. Balance ${matched_po.remaining_balance:.2f}"
                     )
                 else:
-                    exec_logger.complete_stage(f"PO balance update failed: {err}")
+                    exec_logger.complete_stage(f"PO reservation failed safely: {err}")
+                    # The earlier balance check may have raced another invoice.
+                    # Reclassify before commit and persist the failed reservation.
+                    reservation_rule = RuleResult(
+                        rule_id="RULE_PO_BALANCE_RESERVATION",
+                        rule_name="PO Balance Reservation",
+                        category="BALANCE",
+                        result=RuleStatus.FAIL,
+                        severity=RuleSeverity.HARD,
+                        expected_value="Open PO with sufficient remaining balance at commit time",
+                        actual_value=err or "Reservation failed",
+                        explanation="The PO balance changed during processing or the PO is no longer open; this invoice was not approved."
+                    )
+                    validation_results.append(reservation_rule)
+                    decision = self.decision_service.determine_decision(validation_results)
+                    invoice_entity.final_decision = decision.status.value
+                    self.session.add(ValidationResultEntity(
+                        invoice_id=invoice_entity.id,
+                        run_id=run_entity.id,
+                        rule_id=reservation_rule.rule_id,
+                        rule_name=reservation_rule.rule_name,
+                        category=reservation_rule.category,
+                        result=reservation_rule.result.value,
+                        severity=reservation_rule.severity.value,
+                        expected_value=reservation_rule.expected_value,
+                        actual_value=reservation_rule.actual_value,
+                        difference=reservation_rule.difference,
+                        explanation=reservation_rule.explanation,
+                        evidence=reservation_rule.evidence
+                    ))
             else:
-                exec_logger.complete_stage("PO balance unchanged (Invoice not approved or no PO linked).")
+                if late_duplicate and late_duplicate.is_duplicate:
+                    exec_logger.complete_stage("PO balance unchanged; duplicate submission was blocked before reservation.")
+                else:
+                    exec_logger.complete_stage("PO balance unchanged (Invoice not approved or no PO linked).")
+
+            invoice_entity.processing_status = "COMPLETED"
+            invoice_entity.final_decision = decision.status.value
 
             # Stage 19: Generate the final audit report
             exec_logger.start_stage("19. Generate the final audit report")
@@ -332,15 +462,13 @@ class WorkflowOrchestrator:
                 new_status=decision.status.value,
                 actor="SYSTEM_RULES_ENGINE"
             )
-            exec_logger.complete_stage("Audit log entry successfully created.")
-
-            # Finalize run entity
             duration_total_ms = (time.perf_counter() - start_time_perf) * 1000.0
             run_entity.completion_time = datetime.now(timezone.utc)
             run_entity.current_stage = "COMPLETED"
             run_entity.execution_status = "SUCCESS"
             run_entity.final_decision = decision.status.value
             run_entity.duration_ms = round(duration_total_ms, 2)
+            exec_logger.complete_stage("Audit log entry successfully created.")
             run_entity.stages_log = exec_logger.to_json()
 
             self.session.commit()
@@ -387,55 +515,157 @@ class WorkflowOrchestrator:
         """
         if not reason or not reason.strip():
             raise APException("A mandatory justification reason must be provided for manual override.")
+        if not actor or not actor.strip():
+            raise APException("Reviewer name or employee ID is required for the audit trail.")
+        if new_decision not in {status.value for status in DecisionStatus}:
+            raise APException(f"Unsupported decision: {new_decision}.")
 
         invoice = self.inv_repo.get_by_id(invoice_id)
         if not invoice:
             raise APException(f"Invoice ID {invoice_id} not found.")
 
         old_decision = invoice.manual_override_decision or invoice.final_decision
+        old_po_id = invoice.matched_po_id
+        old_amount = round(float(invoice.total_amount or 0.0), 2)
+        old_reason = invoice.manual_override_reason
+        old_actor = invoice.manual_override_by
 
-        # Apply field corrections if supplied
+        def snapshot() -> Dict[str, Any]:
+            vendor = self.vendor_repo.get_by_id(invoice.vendor_id) if invoice.vendor_id else None
+            po = self.po_repo.get_by_id(invoice.matched_po_id) if invoice.matched_po_id else None
+            return {
+                "decision": invoice.manual_override_decision or invoice.final_decision,
+                "vendor_id": invoice.vendor_id,
+                "vendor_name": vendor.legal_name if vendor else None,
+                "matched_po_id": invoice.matched_po_id,
+                "po_number": po.po_number if po else None,
+                "invoice_number": invoice.invoice_number,
+                "total_amount": round(float(invoice.total_amount), 2) if invoice.total_amount is not None else None,
+            }
+
+        before = snapshot()
+
+        target_vendor_id = invoice.vendor_id
+        target_po_id = invoice.matched_po_id
+        target_invoice_number = invoice.invoice_number
+        target_amount = round(float(invoice.total_amount), 2) if invoice.total_amount is not None else None
+
+        # Validate all proposed corrections before mutating the ORM object so a
+        # rejected form submission cannot be committed by the caller's session.
         if corrected_fields:
+            allowed_fields = {"vendor_id", "matched_po_id", "invoice_number", "total_amount"}
+            unexpected = set(corrected_fields) - allowed_fields
+            if unexpected:
+                raise APException(f"Unsupported correction fields: {', '.join(sorted(unexpected))}.")
             if "vendor_id" in corrected_fields:
-                invoice.vendor_id = corrected_fields["vendor_id"]
+                try:
+                    target_vendor_id = int(corrected_fields["vendor_id"]) if corrected_fields["vendor_id"] is not None else None
+                except (TypeError, ValueError) as exc:
+                    raise APException("Corrected vendor ID must be a valid integer.") from exc
+                if target_vendor_id is not None and not self.vendor_repo.get_by_id(target_vendor_id):
+                    raise APException(f"Vendor ID {target_vendor_id} not found.")
             if "matched_po_id" in corrected_fields:
-                invoice.matched_po_id = corrected_fields["matched_po_id"]
+                try:
+                    target_po_id = int(corrected_fields["matched_po_id"]) if corrected_fields["matched_po_id"] is not None else None
+                except (TypeError, ValueError) as exc:
+                    raise APException("Corrected purchase order ID must be a valid integer.") from exc
+                if target_po_id is not None and not self.po_repo.get_by_id(target_po_id):
+                    raise APException(f"Purchase Order ID {target_po_id} not found.")
             if "invoice_number" in corrected_fields:
-                invoice.invoice_number = corrected_fields["invoice_number"]
+                target_invoice_number = str(corrected_fields["invoice_number"]).strip() or None
             if "total_amount" in corrected_fields:
-                invoice.total_amount = float(corrected_fields["total_amount"])
+                try:
+                    corrected_amount = round(float(corrected_fields["total_amount"]), 2)
+                except (TypeError, ValueError) as exc:
+                    raise APException("Corrected invoice amount must be a valid number.") from exc
+                if corrected_amount < 0:
+                    raise APException("Corrected invoice amount cannot be negative.")
+                target_amount = corrected_amount
 
-        # Update PO billing balances if decision is changing to/from APPROVED
-        if invoice.matched_po_id and invoice.total_amount:
-            if new_decision == DecisionStatus.APPROVED.value and old_decision != DecisionStatus.APPROVED.value:
-                self.po_repo.update_billed_balance_atomic(
-                    po_id=invoice.matched_po_id,
-                    invoice_amount=invoice.total_amount,
-                    action="ADD"
-                )
-            elif old_decision == DecisionStatus.APPROVED.value and new_decision != DecisionStatus.APPROVED.value:
-                self.po_repo.update_billed_balance_atomic(
-                    po_id=invoice.matched_po_id,
-                    invoice_amount=invoice.total_amount,
-                    action="REVERT"
-                )
+        if target_po_id is not None and target_vendor_id is None:
+            raise APException("A linked purchase order requires a linked vendor.")
+        if target_po_id is not None and target_vendor_id is not None:
+            corrected_po = self.po_repo.get_by_id(target_po_id)
+            if corrected_po and corrected_po.vendor_id != target_vendor_id:
+                raise APException("The corrected purchase order must belong to the corrected vendor.")
+
+        invoice.vendor_id = target_vendor_id
+        invoice.matched_po_id = target_po_id
+        invoice.invoice_number = target_invoice_number
+        invoice.total_amount = target_amount
+
+        new_po_id = invoice.matched_po_id
+        new_amount = round(float(invoice.total_amount or 0.0), 2)
+
+        after = snapshot()
+        after["decision"] = new_decision
+        changed_fields = {
+            key: {"before": before[key], "after": after[key]}
+            for key in before
+            if before[key] != after[key]
+        }
+        clean_reason = reason.strip()
+        clean_actor = actor.strip()
+        if (
+            invoice.manual_override_at is not None
+            and not changed_fields
+            and old_decision == new_decision
+            and old_reason == clean_reason
+            and old_actor == clean_actor
+        ):
+            # A repeated form submission with the same review payload must not
+            # create duplicate audit entries or reserve the PO balance again.
+            invoice.manual_override_noop = True
+            return invoice
+
+        po_or_amount_changed = old_po_id != new_po_id or old_amount != new_amount
+        try:
+            # Reverse the previously approved reservation before applying the
+            # corrected one. Both operations share this DB transaction, so a
+            # failed replacement rolls back the reversal too.
+            if old_decision == DecisionStatus.APPROVED.value and (
+                new_decision != DecisionStatus.APPROVED.value or po_or_amount_changed
+            ) and old_po_id and old_amount > 0:
+                ok, error = self.po_repo.update_billed_balance_atomic(old_po_id, old_amount, action="REVERT")
+                if not ok:
+                    raise APException(f"Could not release the original PO reservation: {error}")
+
+            if new_decision == DecisionStatus.APPROVED.value and (
+                old_decision != DecisionStatus.APPROVED.value or po_or_amount_changed
+            ):
+                if new_po_id:
+                    if new_amount <= 0:
+                        raise APException("An approved PO invoice requires a positive total amount.")
+                    ok, error = self.po_repo.update_billed_balance_atomic(new_po_id, new_amount, action="ADD")
+                    if not ok:
+                        raise APException(f"Could not reserve the corrected PO balance: {error}")
+        except APException:
+            self.session.rollback()
+            raise
 
         # Update invoice override fields
         invoice.manual_override_decision = new_decision
-        invoice.manual_override_reason = reason.strip()
-        invoice.manual_override_by = actor.strip()
+        invoice.manual_override_reason = clean_reason
+        invoice.manual_override_by = clean_actor
         invoice.manual_override_at = datetime.now(timezone.utc)
 
         # Audit log entry
         self.audit_repo.log(
             action="MANUAL_OVERRIDE",
             invoice_id=invoice.id,
-            details=f"Human override applied by {actor}. Reason: '{reason}'. Corrected fields: {corrected_fields}",
+            details=json.dumps({
+                "version": 1,
+                "actor": clean_actor,
+                "reason": clean_reason,
+                "before": before,
+                "after": after,
+                "changes": changed_fields,
+            }, sort_keys=True),
             previous_status=old_decision,
             new_status=new_decision,
-            actor=actor
+            actor=clean_actor
         )
 
         self.session.commit()
-        logger.info(f"Manual override applied on Invoice {invoice_id}: {old_decision} -> {new_decision} by {actor}")
+        logger.info(f"Manual override applied on Invoice {invoice_id}: {old_decision} -> {new_decision} by {clean_actor}")
         return invoice

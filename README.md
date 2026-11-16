@@ -25,6 +25,9 @@ The repository adheres to clean architecture principles with complete separation
 ap_invoice_engine/
 ├── .env.example               # Environment template for LLM and paths
 ├── requirements.txt           # Python dependency specifications
+├── Dockerfile                 # Render container with Tesseract OCR
+├── render.yaml                # Render Blueprint (free case-study demo defaults)
+├── DEMO_WALKTHROUGH.md        # Five-minute demo narration and click path
 ├── README.md                  # Comprehensive architectural and run documentation
 ├── app/
 │   ├── main.py                # Streamlit application entry point & page router
@@ -100,7 +103,7 @@ The central `WorkflowOrchestrator` coordinates the end-to-end lifecycle of every
 | **2** | **Validate uploaded file** | Inspects magic `%PDF` header bytes, file extension, and enforces size limit (<= 20MB). |
 | **3** | **Calculate file hash** | Computes SHA-256 binary hash for persistent identification. |
 | **4** | **Check for exact duplicate** | Level 1 duplicate check: blocks if an identical file hash has already been processed. |
-| **5** | **Extract PDF text** | Extracts digital text streams using PyMuPDF. |
+| **5** | **Extract document text** | Extracts digital PDF text or OCR text from raster invoice images. |
 | **6** | **Run OCR when necessary** | Evaluates document type. Engages OCR only when text density is insufficient (scanned/hybrid). |
 | **7** | **Extract structured info** | Invokes LLM provider with structured schema (or deterministic demo engine in offline mode). |
 | **8** | **Validate extracted schema** | Enforces strict Pydantic models. Missing values remain `null`; never invented. |
@@ -113,7 +116,7 @@ The central `WorkflowOrchestrator` coordinates the end-to-end lifecycle of every
 | **15** | **Run PO balance validation** | Calculates `remaining_balance = total_amount - billed_amount`. Flags or blocks overbilling. |
 | **16** | **Generate final decision** | Decision engine deterministically maps rule results to `APPROVED`, `NEEDS_REVIEW`, or `BLOCKED`. |
 | **17** | **Save all results** | Persists Invoice, Line Items, and Validation Result entities to SQLite. |
-| **18** | **Update invoice & PO records** | If `APPROVED`, atomically updates cumulative PO billed amount and remaining balance. |
+| **18** | **Update invoice & PO records** | Rechecks for duplicates, then atomically reserves an open PO balance before persisting an `APPROVED` outcome. |
 | **19** | **Generate final audit report** | Emits an immutable `AuditLog` entry documenting the run, decision, actor, and timestamp. |
 
 ---
@@ -122,7 +125,7 @@ The central `WorkflowOrchestrator` coordinates the end-to-end lifecycle of every
 
 ### Prerequisites
 - Python 3.11 (pinned via `runtime.txt`; tested on 3.11–3.13).
-- (Optional) Tesseract OCR on the host (`brew install tesseract` on macOS, `apt-get install tesseract-ocr` on Debian/Ubuntu). If absent, the engine falls back gracefully without crashing. On Streamlit Community Cloud this is installed automatically via `packages.txt`.
+- (Optional) Tesseract OCR on the host (`brew install tesseract` on macOS, `apt-get install tesseract-ocr` on Debian/Ubuntu). If OCR is needed but unavailable, scanned pages are routed to human review instead of being treated as extracted text. On Streamlit Community Cloud, Tesseract is installed via `packages.txt`.
 
 ### Step 1: Clone the Repository
 ```bash
@@ -190,9 +193,53 @@ PYTHONPATH=. streamlit run app/main.py
 ```
 Open your browser to: **`http://localhost:8501`**
 
-Upload an invoice (or use the **Quick Test Scenarios** tab). Each run streams
+Upload a PDF or PNG, JPEG, TIFF, or BMP invoice image (or use the **Quick Test Scenarios** tab). Images are OCR'd through the configured OCR engine and then follow the same extraction, validation, and review process as PDFs. Each run streams
 its 19 stages live as they execute and ends with a reasoned **decision card**
 (status, the reasons behind it, and the recommended next action).
+Stage transitions are also saved to the run history as they happen, so an
+interrupted run retains its last visible stage.
+
+For a clean demo, start with a fresh disposable database. The clean invoice
+consumes PO balance, so rerunning it against a database with previous runs can
+correctly produce a different decision. Do not reset a database containing
+records you need to keep.
+
+### Recovery notes
+
+- **Scenario returns a different decision:** invoice history and PO balances are stateful. Use a fresh disposable database or choose a scenario whose expected preconditions are met; Scenario 7 requires Scenario 1 first.
+- **No scenario fixtures appear:** the app generates fixtures at startup. Check the application logs for a fixture-generation error and verify `SAMPLE_DATA_DIR` is writable.
+- **Scanned invoice reports OCR unavailable:** verify `tesseract --version` in the same runtime as Streamlit. On Render, the Docker image installs Tesseract; locally, set `TESSERACT_CMD` to its executable path if it is not on `PATH`.
+- **Render reports unhealthy:** inspect the service logs for a database connection failure, then confirm the service's `DATABASE_URL` references the Blueprint Postgres service. Render checks `/_stcore/health`.
+- **An uploaded preview is missing after a Render restart:** the free Blueprint uses temporary file storage. Re-upload the document for the demo, or use a paid persistent disk for durable files.
+
+### Deploy on Render
+
+The repository includes `render.yaml` and a Dockerfile. The container installs
+Tesseract and runs Streamlit on Render's assigned `$PORT`; the Blueprint connects
+the app to Render Postgres using psycopg 3.
+
+1. Push the repository to GitHub.
+2. In Render, choose **New → Blueprint**, connect this repository, and review
+   `render.yaml` before creating the services.
+3. The default Blueprint uses a **Free web service** and **Free Postgres** to
+   avoid surprise charges. Render's Free Postgres expires 30 days after creation,
+   and the free web service has an ephemeral filesystem. Uploaded invoice files
+   are therefore temporary and may disappear after a restart or deploy. These
+   settings are for a case-study demo; do not upload real or sensitive invoices.
+4. To persist uploaded files, move the web service to a paid plan and attach a
+   persistent disk mounted at `/var/data`, then set `STORAGE_DIR=/var/data/uploads`.
+   For longer-lived database retention, upgrade Postgres to a paid plan and set
+   backups/retention according to your requirements.
+5. For optional live extraction, add `LLM_API_KEY`, `LLM_BASE_URL`, and
+   `LLM_MODEL` under the Render service's environment settings. Without an API
+   key, the demo extractor remains active. Set `TESSERACT_CMD` only if the
+   container's default `tesseract` executable is unavailable.
+
+The service seeds demo procurement records and fixture files on first launch.
+Render's health check uses Streamlit's `/_stcore/health` endpoint. Check the
+deploy logs if startup fails; the container logs include database connection,
+seed, and OCR initialization errors. A fresh deploy does not migrate or import
+your local SQLite database.
 
 ### Deploy on Streamlit Community Cloud
 
@@ -205,13 +252,13 @@ its 19 stages live as they execute and ends with a reasoned **decision card**
 
 ## 7. Automated Test Suite
 
-Run the full automated test suite containing 25 unit and integration tests:
+Run the full automated unit and integration test suite:
 
 ```bash
 PYTHONPATH=. pytest -v
 ```
 
-All 25 tests cover:
+The tests cover:
 - PDF document classification & OCR abstraction
 - Schema validation & missing-field null handling
 - Exact and fuzzy vendor matching
@@ -220,10 +267,12 @@ All 25 tests cover:
 - Financial arithmetic, tax checks, rounding tolerances, and PO balance overbilling
 - Deterministic decision classification
 - End-to-end workflow execution, atomic PO deductions, and human reviewer overrides
+- Raster image validation and OCR fallback to human review
+- Persisted live stage updates, conditional PO reservations, and corrected approval reconciliation
 
 ---
 
-## 8. Demonstrating the 4 Core Scenarios
+## 8. Demonstrating the 8 Core Scenarios
 
 The system can be tested immediately using the 1-click scenario buttons in the UI under **Upload Invoice > Quick Test Scenarios (1-Click)** or programmatically via the command line:
 
@@ -254,26 +303,56 @@ The system can be tested immediately using the 1-click scenario buttons in the U
 - **Outcome:** `NEEDS_REVIEW`
 - **Evidence:** Soft validation failure flagged for missing critical fields and unlinked PO. Sent to human reviewer workbench for inspection and override.
 
+### Scenario 5: Low-Quality Scan
+- **Document:** `scenario_5_scanned_low_quality.png`
+- **Issue:** Blurred, low-resolution raster scan of an incomplete invoice.
+- **Outcome:** `NEEDS_REVIEW`
+- **Evidence:** Exercises image OCR and confirms missing/uncertain fields are routed to a reviewer.
+
+### Scenario 6: Ambiguous PO
+- **Document:** `scenario_6_ambiguous_po.pdf`
+- **Issue:** Known vendor but no PO reference, leaving multiple plausible orders.
+- **Outcome:** `NEEDS_REVIEW`
+- **Evidence:** The PO matcher does not silently choose among candidates.
+
+### Scenario 7: Changed-PDF Near Duplicate
+- **Document:** `scenario_7_changed_pdf_near_duplicate.pdf`
+- **Issue:** Different file and invoice number, same vendor and amount within seven days of Scenario 1.
+- **Outcome:** `NEEDS_REVIEW`
+- **Evidence:** Level 4 near-duplicate detection flags the candidate for comparison.
+- **Run order:** Process Scenario 1 first; Scenario 7 uses it as its comparison record.
+
+### Scenario 8: Small Tolerance Variance
+- **Document:** `scenario_8_small_tolerance_variance.pdf`
+- **Issue:** $0.04 total arithmetic variance and 0.5% unit-price variance.
+- **Outcome:** `APPROVED` when run against a fresh database and open PO balance.
+- **Evidence:** Both differences sit within the configured tolerances.
+
 ---
 
 ## 9. Human Review & Manual Overrides
 
-When an invoice receives `NEEDS_REVIEW` or `BLOCKED`, authorized AP personnel can audit the invoice:
+When an invoice receives `NEEDS_REVIEW` or `BLOCKED`, a reviewer can audit the invoice:
 1. Navigate to **Invoice Details**.
 2. Inspect the PDF page preview, extracted fields, matched vendor, matched PO, and rule check logs.
-3. Submit an override decision (`APPROVED`, `NEEDS_REVIEW`, `BLOCKED`) with a **mandatory justification reason**.
-4. The system preserves the original automated decision, records the reviewer's identity and timestamp in `AuditLog`, and atomically adjusts the PO balance if approved.
+3. Optionally correct the vendor, PO, invoice number, or total. A PO must belong to the selected vendor.
+4. Submit an override decision (`APPROVED`, `NEEDS_REVIEW`, `BLOCKED`) with a **mandatory reason** and reviewer label.
+5. The system preserves the automated extraction payload, records the reviewer's before/after values and timestamp, and atomically adjusts the PO balance if approval changes the reservation. Repeating the same review action is idempotent and does not create another audit event.
+
+The reviewer label is user-entered for the case-study demo; it is not authenticated identity. Add login and role checks before using this workflow with real AP operators.
 
 ---
 
 ## 10. Limitations & Future Roadmap
 
-### Current Scope & Local Dev Boundaries
-- **Single-tenant Local Database:** Uses thread-safe SQLite with PRAGMA foreign keys enabled.
+### Current Scope & Demo Boundaries
+- **Local development:** Uses thread-safe SQLite with PRAGMA foreign keys enabled. Render demo uses managed Postgres.
+- **Demo identity and retention:** Reviewer names are self-entered, and Render free storage is temporary. Do not use production invoices.
 - **Payment Execution:** Intentionally stops at the approval/escalation decision; does not execute direct banking payments.
 
-### Planned Enhancements (PS-2 & Beyond)
-1. **Multi-Currency FX Rates:** Integration with European Central Bank or OpenExchangeRates API for dynamic cross-currency conversion against PO base currency.
-2. **Advanced Multi-Page Table Stitching:** Enhancing line item extraction across multi-page purchase invoices with repeated headers.
-3. **ERP Integrations:** Webhook connectors for SAP, NetSuite, and QuickBooks for automatic bill creation post-approval.
-4. **Role-Based Access Control (RBAC):** SAML/OAuth2 authentication distinguishing AP Clerks, Senior Analysts, and Financial Controllers.
+### Next Architecture Steps
+1. Add authenticated users and role-based approval limits, with immutable reviewer identity from the auth provider.
+2. Add database migrations and a paid managed database with backups, retention, and restore drills.
+3. Move invoice binaries to controlled object storage with encryption and retention policies.
+4. Add tenant boundaries, operational monitoring, and ERP integrations behind provider interfaces.
+5. Consider multi-currency FX rates and advanced multi-page table stitching after the core operational controls are in place.

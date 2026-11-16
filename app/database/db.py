@@ -8,16 +8,26 @@ from sqlalchemy.orm import sessionmaker, Session
 from app.config.settings import settings
 from app.database.entities import Base
 
-# Create SQLite engine with thread safety and foreign keys enabled
-connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+def _sqlalchemy_database_url(value: str) -> str:
+    """Normalize Render's postgres URL and select the installed psycopg 3 driver."""
+    if value.startswith("postgres://"):
+        return "postgresql+psycopg://" + value[len("postgres://"):]
+    if value.startswith("postgresql://"):
+        return "postgresql+psycopg://" + value[len("postgresql://"):]
+    return value
+
+
+database_url = _sqlalchemy_database_url(settings.DATABASE_URL)
+is_sqlite = database_url.startswith("sqlite")
+connect_args = {"check_same_thread": False} if is_sqlite else {}
 engine = create_engine(
-    settings.DATABASE_URL,
+    database_url,
     echo=False,
     connect_args=connect_args
 )
 
 # Enable foreign keys for SQLite
-if settings.DATABASE_URL.startswith("sqlite"):
+if is_sqlite:
     from sqlalchemy import event
     @event.listens_for(engine, "connect")
     def set_sqlite_pragma(dbapi_connection, connection_record):

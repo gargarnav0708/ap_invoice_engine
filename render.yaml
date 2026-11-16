@@ -1,0 +1,32 @@
+# Case-study demo defaults use free Render resources to avoid surprise charges.
+# See README.md for the 30-day database and ephemeral-upload limitations.
+services:
+  - type: web
+    name: ap-invoice-engine
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ap-invoice-engine-db
+          property: connectionString
+      - key: STORAGE_DIR
+        value: /tmp/ap-invoice-uploads
+      - key: SAMPLE_DATA_DIR
+        value: /app/data/sample_data
+      - key: OCR_ENABLED
+        value: "true"
+      - key: ENABLE_DEMO_MODE
+        value: "true"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+databases:
+  - name: ap-invoice-engine-db
+    plan: free
+    databaseName: ap_invoice_engine

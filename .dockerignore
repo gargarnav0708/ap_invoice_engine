@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+.streamlit/secrets.toml
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.coverage
+htmlcov
+.DS_Store
+data/ap_invoices.db
+data/ap_invoices.db-*
+data/uploads/*
+!data/uploads/.gitkeep

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import settings
 from app.config.rules import rules_config
+from app.ingestion.ocr_engine import get_ocr_engine
 from app.database.entities import Vendor, PurchaseOrder, Invoice
 from scripts.seed_database import seed
 
@@ -26,7 +27,9 @@ def render_settings(session: Session):
             st.warning("🟡 **Offline / Demo Mode Active**")
             st.caption("No `LLM_API_KEY` configured in `.env`. Running deterministic extraction engine.")
     with col2:
-        st.write(f"- **OCR Enabled:** `{'Yes' if settings.OCR_ENABLED else 'No'}`")
+        ocr_engine = get_ocr_engine()
+        ocr_status = "Tesseract ready" if ocr_engine.is_available() else "Unavailable"
+        st.write(f"- **OCR Runtime:** `{ocr_status}`")
         st.write(f"- **Environment:** `{settings.APP_ENV}`")
         st.write(f"- **Database URL:** `{settings.DATABASE_URL}`")
 

@@ -2,9 +2,17 @@
 Unit tests for data extraction, schema validation, and confidence scoring.
 """
 import pytest
+from pydantic import ValidationError
+
 from app.core.schemas import ExtractedInvoice, ExtractedField, ExtractedLineItem
 from app.extraction.confidence import compute_overall_confidence
 from app.extraction.llm_provider import MockLLMProvider
+
+
+@pytest.mark.parametrize("confidence", [-0.01, 1.01])
+def test_overall_confidence_must_be_between_zero_and_one(confidence):
+    with pytest.raises(ValidationError):
+        ExtractedInvoice(overall_confidence=confidence)
 
 
 def test_extracted_schema_missing_fields_are_null():

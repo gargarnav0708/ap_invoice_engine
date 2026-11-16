@@ -8,7 +8,8 @@ from app.database.entities import Invoice, PurchaseOrder, AuditLog
 from app.workflow.orchestrator import WorkflowOrchestrator
 
 
-def test_workflow_clean_invoice_end_to_end(test_db_session):
+def test_workflow_clean_invoice_end_to_end(test_db_session, monkeypatch):
+    monkeypatch.setattr(settings, "LLM_API_KEY", "")
     orchestrator = WorkflowOrchestrator(test_db_session)
     clean_file = settings.SAMPLE_DATA_DIR / "scenario_1_clean_invoice.pdf"
 

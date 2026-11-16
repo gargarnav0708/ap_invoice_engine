@@ -157,6 +157,16 @@ def render_invoice_details(session: Session):
         if extracted.get("overall_confidence") is not None:
             st.caption(f"Overall extraction confidence: **{extracted['overall_confidence']*100:.0f}%**")
 
+    if invoice.manual_override_at:
+        st.markdown("#### Reviewer-accepted values now in effect")
+        final_vendor = invoice.vendor.legal_name if invoice.vendor else "Unmatched"
+        final_po = invoice.matched_po.po_number if invoice.matched_po else "Unlinked"
+        value_cols = st.columns(4)
+        value_cols[0].metric("Vendor", final_vendor)
+        value_cols[1].metric("Invoice #", invoice.invoice_number or "—")
+        value_cols[2].metric("Purchase order", final_po)
+        value_cols[3].metric("Total", f"{invoice.currency or 'USD'} {invoice.total_amount:,.2f}" if invoice.total_amount is not None else "—")
+
     st.markdown("---")
 
     # 3-Way Match: Vendor, PO, Line Items
@@ -234,7 +244,12 @@ def render_invoice_details(session: Session):
 
     # Human Review & Manual Override Section
     st.subheader("✍️ Human-in-the-Loop Review & Decision Override")
-    st.caption("Authorised AP reviewers can override decisions or correct fields with mandatory justification.")
+    st.caption("Demo reviewer identity is entered below. Decision changes and corrections require a reason and are recorded with before/after values.")
+
+    review_notice = st.session_state.pop("_review_notice", None)
+    if review_notice:
+        kind, message = review_notice
+        getattr(st, kind)(message)
 
     with st.form("manual_override_form"):
         col_ov1, col_ov2 = st.columns(2)
@@ -251,6 +266,36 @@ def render_invoice_details(session: Session):
                 placeholder="Explain why this decision is being modified or verified..."
             )
 
+        with st.expander("Optional reviewer corrections"):
+            st.caption("The original extraction payload remains preserved as source evidence. Corrected values are saved separately and shown in the audit trail.")
+            vendors = session.query(Vendor).order_by(Vendor.legal_name).all()
+            purchase_orders = session.query(PurchaseOrder).order_by(PurchaseOrder.po_number).all()
+            selected_vendor_id = st.selectbox(
+                "Correct vendor (optional)",
+                options=[None] + [vendor.id for vendor in vendors],
+                format_func=lambda value: "Keep current vendor" if value is None else next(
+                    (f"{vendor.legal_name} (ID {vendor.id})" for vendor in vendors if vendor.id == value), str(value)
+                ),
+            )
+            selected_po_id = st.selectbox(
+                "Correct purchase order (optional)",
+                options=[None] + [po.id for po in purchase_orders],
+                format_func=lambda value: "Keep current purchase order" if value is None else next(
+                    (f"{po.po_number} — {po.vendor.legal_name}" for po in purchase_orders if po.id == value), str(value)
+                ),
+            )
+            corrected_invoice_number = st.text_input(
+                "Correct invoice number (leave unchanged to keep current)",
+                value=invoice.invoice_number or "",
+            )
+            corrected_total_amount = st.number_input(
+                f"Correct total amount ({invoice.currency or 'USD'})",
+                min_value=0.0,
+                value=float(invoice.total_amount or 0.0),
+                step=0.01,
+                format="%.2f",
+            )
+
         submit_override = st.form_submit_button("💾 Save Manual Override & Update Audit Trail", type="primary")
 
         if submit_override:
@@ -259,13 +304,31 @@ def render_invoice_details(session: Session):
             else:
                 try:
                     orchestrator = WorkflowOrchestrator(session)
-                    orchestrator.apply_manual_override(
+                    corrected_fields = {}
+                    if selected_vendor_id is not None:
+                        corrected_fields["vendor_id"] = selected_vendor_id
+                    if selected_po_id is not None:
+                        corrected_fields["matched_po_id"] = selected_po_id
+                    if (corrected_invoice_number.strip() or None) != invoice.invoice_number:
+                        corrected_fields["invoice_number"] = corrected_invoice_number
+                    current_total = round(float(invoice.total_amount), 2) if invoice.total_amount is not None else None
+                    if round(float(corrected_total_amount), 2) != current_total:
+                        corrected_fields["total_amount"] = corrected_total_amount
+                    updated_invoice = orchestrator.apply_manual_override(
                         invoice_id=invoice.id,
                         new_decision=override_action,
                         reason=override_reason,
-                        actor=reviewer_name
+                        actor=reviewer_name,
+                        corrected_fields=corrected_fields or None,
                     )
-                    st.success(f"Successfully applied manual override: Decision set to {override_action}.")
+                    if getattr(updated_invoice, "manual_override_noop", False):
+                        st.session_state["_review_notice"] = (
+                            "info", "This exact review action was already recorded; no duplicate audit event was created."
+                        )
+                    else:
+                        st.session_state["_review_notice"] = (
+                            "success", f"Review saved: decision set to {override_action}, with an audit entry."
+                        )
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to apply override: {e}")
@@ -277,6 +340,30 @@ def render_invoice_details(session: Session):
     logs = session.query(AuditLog).filter(AuditLog.invoice_id == invoice.id).order_by(AuditLog.timestamp.desc()).all()
 
     if logs:
+        review_logs = [log for log in logs if log.action == "MANUAL_OVERRIDE"]
+        if review_logs:
+            st.markdown("#### Reviewer corrections — before and after")
+            for log in review_logs:
+                try:
+                    payload = json.loads(log.details or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                with st.expander(
+                    f"{log.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC · {log.actor} · "
+                    f"{log.previous_status or '—'} → {log.new_status or '—'}",
+                    expanded=False,
+                ):
+                    st.write(f"**Reason:** {payload.get('reason') or log.details or '—'}")
+                    changes = payload.get("changes", {})
+                    if changes:
+                        change_rows = [
+                            {"Field": key.replace("_", " ").title(), "Before": values.get("before"), "After": values.get("after")}
+                            for key, values in changes.items()
+                        ]
+                        st.dataframe(pd.DataFrame(change_rows), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No extracted fields changed in this review action.")
+
         audit_rows = []
         for log in logs:
             audit_rows.append({

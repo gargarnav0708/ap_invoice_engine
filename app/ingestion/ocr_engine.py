@@ -53,14 +53,14 @@ class TesseractOCREngine(BaseOCREngine):
 
 
 class FallbackOCREngine(BaseOCREngine):
-    """Fallback OCR engine used when local Tesseract is not installed."""
+    """Unavailable OCR implementation used when no OCR runtime is installed."""
 
     def is_available(self) -> bool:
-        return True
+        return False
 
     def extract_text_from_image(self, image: Image.Image) -> str:
-        logger.info("Using Fallback OCR Engine (Tesseract not installed on host).")
-        return "[OCR_FALLBACK_TEXT: Scanned document text unreadable without OCR binary]"
+        logger.warning("OCR is unavailable; scanned page was not transcribed.")
+        return ""
 
 
 def get_ocr_engine() -> BaseOCREngine:

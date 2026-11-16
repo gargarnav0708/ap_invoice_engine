@@ -3,8 +3,7 @@ Pydantic schemas for data validation, structured extraction, matching, and decis
 """
 from enum import Enum
 from typing import Optional, List, Dict, Any, Generic, TypeVar
-from datetime import date, datetime
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 T = TypeVar("T")
 
@@ -57,34 +56,35 @@ class ExtractedField(BaseModel, Generic[T]):
 
 class ExtractedLineItem(BaseModel):
     """Structured line item extracted from an invoice."""
-    description: ExtractedField[str] = Field(default_factory=ExtractedField)
-    quantity: ExtractedField[float] = Field(default_factory=ExtractedField)
-    unit: ExtractedField[str] = Field(default_factory=ExtractedField)
-    unit_price: ExtractedField[float] = Field(default_factory=ExtractedField)
-    tax_amount: ExtractedField[float] = Field(default_factory=ExtractedField)
-    line_total: ExtractedField[float] = Field(default_factory=ExtractedField)
+    description: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    quantity: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
+    unit: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    unit_price: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
+    tax_amount: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
+    line_total: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
 
 
 class ExtractedInvoice(BaseModel):
     """Complete structured invoice extracted from PDF."""
-    vendor_name: ExtractedField[str] = Field(default_factory=ExtractedField)
-    vendor_address: ExtractedField[str] = Field(default_factory=ExtractedField)
-    vendor_tax_id: ExtractedField[str] = Field(default_factory=ExtractedField)
-    invoice_number: ExtractedField[str] = Field(default_factory=ExtractedField)
-    invoice_date: ExtractedField[str] = Field(default_factory=ExtractedField)
-    due_date: ExtractedField[str] = Field(default_factory=ExtractedField)
-    po_reference: ExtractedField[str] = Field(default_factory=ExtractedField)
-    currency: ExtractedField[str] = Field(default_factory=ExtractedField)
-    subtotal: ExtractedField[float] = Field(default_factory=ExtractedField)
-    tax_amount: ExtractedField[float] = Field(default_factory=ExtractedField)
-    total_amount: ExtractedField[float] = Field(default_factory=ExtractedField)
+    vendor_name: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    vendor_address: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    vendor_tax_id: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    invoice_number: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    invoice_date: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    due_date: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    po_reference: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    currency: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    subtotal: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
+    tax_amount: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
+    total_amount: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
     line_items: List[ExtractedLineItem] = Field(default_factory=list)
 
     # Document-level metadata
     raw_text: Optional[str] = None
     document_type: DocumentType = DocumentType.MACHINE_READABLE
     is_mock: bool = False
-    overall_confidence: float = 0.0
+    overall_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
 
 
 # ==============================================================================

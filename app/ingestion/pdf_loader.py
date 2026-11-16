@@ -4,7 +4,7 @@ PDF document loader and text extractor using PyMuPDF and pdfplumber with OCR fal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from PIL import Image
+from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 import io
 import pymupdf
 import pdfplumber
@@ -13,6 +13,7 @@ from app.core.exceptions import IngestionError
 from app.core.schemas import DocumentType
 from app.ingestion.document_classifier import classify_document
 from app.ingestion.ocr_engine import get_ocr_engine
+from app.utils.file_storage import SUPPORTED_IMAGE_EXTENSIONS
 from app.utils.logging import get_logger
 
 logger = get_logger("pdf_loader")
@@ -36,6 +37,7 @@ class IngestionResult:
     pages: List[PageData]
     metadata: Dict[str, Any] = field(default_factory=dict)
     ocr_applied: bool = False
+    ocr_unavailable: bool = False
 
 
 class PDFLoader:
@@ -46,8 +48,15 @@ class PDFLoader:
         """
         Loads PDF, classifies document structure, extracts text and tables, and applies OCR if necessary.
         """
+        return self.load_document(file_path, render_preview=render_preview)
+
+    def load_document(self, file_path: Path, render_preview: bool = True) -> IngestionResult:
+        """Load a supported PDF or raster image invoice and extract its text."""
         if not file_path.exists():
-            raise IngestionError(f"PDF file does not exist at {file_path}")
+            raise IngestionError(f"Invoice document does not exist at {file_path}")
+
+        if file_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            return self._load_image(file_path, render_preview=render_preview)
 
         try:
             doc = pymupdf.open(str(file_path))
@@ -64,6 +73,7 @@ class PDFLoader:
         doc_type, meta = classify_document(doc)
 
         ocr_applied = False
+        ocr_unavailable = False
         pages_data: List[PageData] = []
         full_text_parts: List[str] = []
 
@@ -107,6 +117,10 @@ class PDFLoader:
                     if ocr_text:
                         extracted_text = (extracted_text + "\n" + ocr_text).strip()
                         ocr_applied = True
+                    else:
+                        ocr_unavailable = True
+                else:
+                    ocr_unavailable = True
 
             pages_data.append(
                 PageData(
@@ -138,5 +152,55 @@ class PDFLoader:
             full_text=full_text,
             pages=pages_data,
             metadata=meta,
-            ocr_applied=ocr_applied
+            ocr_applied=ocr_applied,
+            ocr_unavailable=ocr_unavailable
+        )
+
+    def _load_image(self, file_path: Path, render_preview: bool = True) -> IngestionResult:
+        """OCR each frame of a raster invoice, retaining page previews and text."""
+        try:
+            with Image.open(file_path) as source:
+                image_format = source.format or file_path.suffix.lstrip(".").upper()
+                image_size = source.size
+                frames = [frame.copy() for frame in ImageSequence.Iterator(source)]
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise IngestionError(f"Failed to open invoice image: {exc}") from exc
+
+        if not frames:
+            raise IngestionError("Invoice image contains no pages.")
+
+        pages: List[PageData] = []
+        text_parts: List[str] = []
+        ocr_applied = False
+        ocr_unavailable = False
+        for page_number, frame in enumerate(frames, start=1):
+            preview = ImageOps.exif_transpose(frame).convert("RGB")
+            text = self.ocr_engine.extract_text_from_image(preview).strip()
+            if text:
+                ocr_applied = True
+                text_parts.append(f"--- Page {page_number} ---\n{text}")
+            else:
+                ocr_unavailable = True
+            pages.append(PageData(
+                page_number=page_number,
+                text=text,
+                char_count=len(text),
+                has_images=True,
+                image_preview=preview if render_preview else None,
+            ))
+
+        full_text = "\n\n".join(text_parts)
+        logger.info(
+            f"Ingested image invoice '{file_path.name}': {len(pages)} frame(s), "
+            f"{len(full_text)} characters, OCR={ocr_applied}"
+        )
+        return IngestionResult(
+            file_path=file_path,
+            total_pages=len(pages),
+            document_type=DocumentType.SCANNED_IMAGE,
+            full_text=full_text,
+            pages=pages,
+            metadata={"image_format": image_format, "image_size": image_size},
+            ocr_applied=ocr_applied,
+            ocr_unavailable=ocr_unavailable,
         )

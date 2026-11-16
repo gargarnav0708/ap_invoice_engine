@@ -4,7 +4,7 @@ Database repositories with atomic transactions and domain query methods.
 from typing import List, Optional, Tuple
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, func
+from sqlalchemy import or_, and_, func, update
 
 from app.database.entities import (
     Vendor, PurchaseOrder, POLineItem, Invoice,
@@ -80,20 +80,54 @@ class PORepository:
         action='ADD' increases billed_amount and decreases remaining_balance.
         action='REVERT' decreases billed_amount and increases remaining_balance.
         """
-        po = self.session.query(PurchaseOrder).filter(PurchaseOrder.id == po_id).with_for_update().first()
-        if not po:
-            return False, f"Purchase Order ID {po_id} not found."
+        amount_cents = int(round(float(invoice_amount) * 100))
+        if amount_cents <= 0:
+            return False, "Invoice amount must be greater than zero."
+        if action not in {"ADD", "REVERT"}:
+            return False, f"Unsupported PO balance action: {action}."
 
-        if action == "ADD":
-            po.billed_amount = round(po.billed_amount + invoice_amount, 2)
-            po.remaining_balance = round(po.total_amount - po.billed_amount, 2)
-            if po.remaining_balance <= 0.00:
-                po.remaining_balance = max(0.0, po.remaining_balance)
-        elif action == "REVERT":
-            po.billed_amount = max(0.0, round(po.billed_amount - invoice_amount, 2))
-            po.remaining_balance = round(po.total_amount - po.billed_amount, 2)
-
+        # Persist pending invoice edits within the same transaction before
+        # expiring ORM state after the conditional balance update.
         self.session.flush()
+
+        # A conditional SQL UPDATE is atomic on SQLite as well as server DBs;
+        # SELECT ... FOR UPDATE alone is ignored by SQLite.  Compare cents to
+        # avoid binary-float boundary errors while preserving the existing schema.
+        billed_cents = func.round(PurchaseOrder.billed_amount * 100, 0)
+        remaining_cents = func.round(PurchaseOrder.remaining_balance * 100, 0)
+        if action == "ADD":
+            stmt = (
+                update(PurchaseOrder)
+                .where(
+                    PurchaseOrder.id == po_id,
+                    PurchaseOrder.status == "OPEN",
+                    remaining_cents >= amount_cents,
+                )
+                .values(
+                    billed_amount=func.round(PurchaseOrder.billed_amount + amount_cents / 100, 2),
+                    remaining_balance=func.round(PurchaseOrder.remaining_balance - amount_cents / 100, 2),
+                )
+            )
+        else:
+            stmt = (
+                update(PurchaseOrder)
+                .where(PurchaseOrder.id == po_id, billed_cents >= amount_cents)
+                .values(
+                    billed_amount=func.round(PurchaseOrder.billed_amount - amount_cents / 100, 2),
+                    remaining_balance=func.round(PurchaseOrder.remaining_balance + amount_cents / 100, 2),
+                )
+            )
+
+        result = self.session.execute(stmt.execution_options(synchronize_session=False))
+        if result.rowcount != 1:
+            po_exists = self.session.query(PurchaseOrder.id).filter(PurchaseOrder.id == po_id).first()
+            if not po_exists:
+                return False, f"Purchase Order ID {po_id} not found."
+            if action == "ADD":
+                return False, "PO is not open or no longer has enough remaining balance."
+            return False, "PO billed balance is smaller than the amount being reversed."
+
+        self.session.expire_all()
         return True, None
 
 
