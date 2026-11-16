@@ -4,7 +4,7 @@ Main Streamlit application entry point.
 """
 import streamlit as st
 from app.config.settings import settings
-from app.database.db import init_db, get_db
+from app.database.db import engine, init_db, get_db
 from app.utils.logging import get_logger
 from app.ingestion.ocr_engine import get_ocr_engine
 from app.ui.dashboard import render_dashboard
@@ -111,7 +111,8 @@ def main():
 
         ocr_engine = get_ocr_engine()
         ocr_status = "Tesseract ready" if ocr_engine.is_available() else "Unavailable"
-        st.caption(f"DB: SQLite | OCR: {ocr_status}")
+        db_status = engine.dialect.name.replace("postgresql", "PostgreSQL").title()
+        st.caption(f"DB: {db_status} | OCR: {ocr_status}")
 
     # Main Content Area
     with get_db() as session:
