@@ -111,7 +111,7 @@ def main():
 
         ocr_engine = get_ocr_engine()
         ocr_status = "Tesseract ready" if ocr_engine.is_available() else "Unavailable"
-        db_status = engine.dialect.name.replace("postgresql", "PostgreSQL").title()
+        db_status = "PostgreSQL" if engine.dialect.name == "postgresql" else engine.dialect.name.title()
         st.caption(f"DB: {db_status} | OCR: {ocr_status}")
 
     # Main Content Area
