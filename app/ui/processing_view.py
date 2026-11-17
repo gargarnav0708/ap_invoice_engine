@@ -48,8 +48,15 @@ def render_processing_view(session: Session):
             "APPROVED": "🟢 APPROVED",
             "NEEDS_REVIEW": "🟠 NEEDS REVIEW",
             "BLOCKED": "🔴 BLOCKED"
-        }.get(run.final_decision, run.final_decision or "IN PROGRESS")
+        }.get(
+            run.final_decision,
+            "🔴 FAILED · NEEDS REVIEW" if run.execution_status == "FAILED"
+            else run.final_decision or "IN PROGRESS",
+        )
         st.metric("Final Outcome", decision_badge)
+
+    if run.execution_status == "FAILED":
+        st.error(f"This run failed and needs review. {run.error_message or 'See the failed stage below for details.'}")
 
     st.markdown("---")
     st.subheader("19-Stage Workflow Execution Trace")

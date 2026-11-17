@@ -13,7 +13,7 @@ from app.core.schemas import (
     ExtractedInvoice, ExtractedField, ExtractedLineItem
 )
 from app.extraction.extraction_prompts import (
-    SYSTEM_EXTRACTION_PROMPT, build_user_prompt
+    SYSTEM_EXTRACTION_PROMPT, build_user_prompt, build_strict_extraction_schema
 )
 from app.extraction.confidence import compute_overall_confidence
 from app.utils.logging import get_logger
@@ -57,7 +57,14 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                     {"role": "system", "content": SYSTEM_EXTRACTION_PROMPT},
                     {"role": "user", "content": build_user_prompt(document_text)}
                 ],
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "invoice_extraction",
+                        "strict": True,
+                        "schema": build_strict_extraction_schema(),
+                    },
+                },
                 temperature=0.0,
                 timeout=45.0
             )

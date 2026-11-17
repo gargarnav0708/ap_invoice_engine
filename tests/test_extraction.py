@@ -2,11 +2,13 @@
 Unit tests for data extraction, schema validation, and confidence scoring.
 """
 import pytest
+from types import SimpleNamespace
 from pydantic import ValidationError
 
 from app.core.schemas import ExtractedInvoice, ExtractedField, ExtractedLineItem
 from app.extraction.confidence import compute_overall_confidence
-from app.extraction.llm_provider import MockLLMProvider
+from app.extraction.llm_provider import MockLLMProvider, OpenAICompatibleProvider
+from app.extraction.extraction_prompts import build_strict_extraction_schema
 
 
 @pytest.mark.parametrize("confidence", [-0.01, 1.01])
@@ -77,3 +79,44 @@ def test_mock_llm_provider_extraction():
     assert extracted.total_amount.value == 1350.00
     assert len(extracted.line_items) == 1
     assert extracted.line_items[0].description.value == "Industrial Safety Helmets"
+
+
+def test_strict_extraction_schema_marks_every_object_property_required():
+    schema = build_strict_extraction_schema()
+
+    def check(node):
+        if node.get("type") == "object":
+            assert node["additionalProperties"] is False
+            assert node["required"] == list(node["properties"])
+            for child in node["properties"].values():
+                check(child)
+        elif node.get("type") == "array":
+            check(node["items"])
+
+    check(schema)
+    assert schema["properties"]["vendor_name"]["properties"]["page"]["type"] == ["integer", "null"]
+    assert schema["properties"]["line_items"]["items"]["properties"]["description"]["properties"]["page"]["type"] == ["integer", "null"]
+
+
+def test_live_provider_requests_strict_json_schema(monkeypatch):
+    provider = OpenAICompatibleProvider(api_key="test-key", base_url="https://example.invalid/v1", model="test-model")
+    captured = {}
+    payload = {
+        "vendor_name": {"value": "Acme Inc", "confidence": 0.9, "evidence": "Acme Inc", "page": 1},
+        "invoice_number": {"value": "INV-1", "confidence": 0.9, "evidence": "INV-1", "page": 1},
+        "total_amount": {"value": 100.0, "confidence": 0.9, "evidence": "Total 100.00", "page": 1},
+        "currency": {"value": "USD", "confidence": 0.9, "evidence": "USD", "page": 1},
+        "line_items": [],
+    }
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=__import__("json").dumps(payload)))])
+
+    provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = provider.extract_invoice("Acme Inc invoice INV-1 total 100 USD")
+
+    assert result.invoice_number.value == "INV-1"
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["response_format"]["json_schema"]["strict"] is True
+    assert captured["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
