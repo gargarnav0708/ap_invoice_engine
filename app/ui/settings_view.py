@@ -25,7 +25,10 @@ def render_settings(session: Session):
             st.write(f"- **Model:** `{settings.LLM_MODEL}`")
         else:
             st.warning("🟡 **Offline / Demo Mode Active**")
-            st.caption("No `LLM_API_KEY` configured in `.env`. Running deterministic extraction engine.")
+            st.caption(
+                "No `LLM_API_KEY` is configured for this runtime. Add it to `.env` locally "
+                "or to the service environment variables on Render. Running deterministic extraction."
+            )
     with col2:
         ocr_engine = get_ocr_engine()
         ocr_status = "Tesseract ready" if ocr_engine.is_available() else "Unavailable"
