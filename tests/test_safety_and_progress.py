@@ -12,6 +12,7 @@ from app.config.settings import settings
 from app.core.exceptions import WorkflowError
 from app.core.schemas import DecisionStatus
 from app.database.entities import AuditLog, Invoice, ProcessingRun, PurchaseOrder
+from app.ingestion.pdf_loader import PDFLoader
 from app.utils.file_storage import validate_document_bytes
 from app.workflow.orchestrator import WorkflowOrchestrator
 
@@ -32,6 +33,12 @@ def test_po_reservation_is_conditional_and_cent_exact(test_db_session):
     po = test_db_session.query(PurchaseOrder).filter_by(id=po.id).one()
     assert po.billed_amount == 5000.00
     assert po.remaining_balance == 0.00
+
+
+def test_overbilling_fixture_includes_all_non_target_critical_fields():
+    invoice = REPO_ROOT / "data/sample_data/scenario_3_split_overbilling.pdf"
+    text = PDFLoader().load_pdf(invoice).full_text
+    assert "Currency: USD" in text
 
 
 def test_corrected_approved_invoice_moves_po_reservation(test_db_session):

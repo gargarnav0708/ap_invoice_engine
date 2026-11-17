@@ -106,6 +106,8 @@ def build_pdf_invoice(
     ]))
     story.append(meta_table)
     story.append(Spacer(1, 20))
+    story.append(Paragraph(f"<b>Currency:</b> {currency}", normal_style))
+    story.append(Spacer(1, 8))
 
     # Line Items Table
     curr_sym = "£" if currency == "GBP" else ("€" if currency == "EUR" else "$")
