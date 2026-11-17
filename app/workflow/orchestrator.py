@@ -482,6 +482,7 @@ class WorkflowOrchestrator:
             logger.error(f"Processing error in workflow: {e}", exc_info=True)
             duration_total_ms = (time.perf_counter() - start_time_perf) * 1000.0
             exec_logger.fail_stage(str(e))
+            failed_stage = run_entity.current_stage if run_entity else "UNKNOWN"
 
             if invoice_entity:
                 invoice_entity.processing_status = "FAILED"
@@ -493,8 +494,19 @@ class WorkflowOrchestrator:
                 run_entity.error_message = str(e)
                 run_entity.duration_ms = round(duration_total_ms, 2)
                 run_entity.stages_log = exec_logger.to_json()
+                run_entity.final_decision = DecisionStatus.NEEDS_REVIEW.value
 
             try:
+                if invoice_entity and run_entity:
+                    self.audit_repo.log(
+                        action="WORKFLOW_FAILED",
+                        invoice_id=invoice_entity.id,
+                        run_id=run_entity.id,
+                        details=f"Processing failed at {failed_stage}: {e}",
+                        previous_status="PROCESSING",
+                        new_status=DecisionStatus.NEEDS_REVIEW.value,
+                        actor="SYSTEM",
+                    )
                 self.session.commit()
             except Exception:
                 pass

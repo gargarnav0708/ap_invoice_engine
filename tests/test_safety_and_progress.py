@@ -4,12 +4,15 @@ from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+import pytest
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from app.config.settings import settings
+from app.core.exceptions import WorkflowError
 from app.core.schemas import DecisionStatus
-from app.database.entities import Invoice, ProcessingRun, PurchaseOrder
+from app.database.entities import AuditLog, Invoice, ProcessingRun, PurchaseOrder
+from app.ingestion.pdf_loader import PDFLoader
 from app.utils.file_storage import validate_document_bytes
 from app.workflow.orchestrator import WorkflowOrchestrator
 
@@ -32,6 +35,12 @@ def test_po_reservation_is_conditional_and_cent_exact(test_db_session):
     assert po.remaining_balance == 0.00
 
 
+def test_overbilling_fixture_includes_all_non_target_critical_fields():
+    invoice = REPO_ROOT / "data/sample_data/scenario_3_split_overbilling.pdf"
+    text = PDFLoader().load_pdf(invoice).full_text
+    assert "Currency: USD" in text
+
+
 def test_corrected_approved_invoice_moves_po_reservation(test_db_session):
     old_po = test_db_session.query(PurchaseOrder).filter_by(po_number="PO-2026-001").one()
     new_po = test_db_session.query(PurchaseOrder).filter_by(po_number="PO-2026-002").one()
@@ -41,6 +50,7 @@ def test_corrected_approved_invoice_moves_po_reservation(test_db_session):
         original_filename="approved.pdf",
         file_hash="a" * 64,
         file_path="approved.pdf",
+        vendor_id=old_po.vendor_id,
         matched_po_id=old_po.id,
         invoice_number="INV-TEST-1",
         total_amount=1350.00,
@@ -54,7 +64,7 @@ def test_corrected_approved_invoice_moves_po_reservation(test_db_session):
         invoice_id=invoice.id,
         new_decision=DecisionStatus.APPROVED.value,
         reason="Corrected PO reference and amount",
-        corrected_fields={"matched_po_id": new_po.id, "total_amount": 100.00},
+        corrected_fields={"vendor_id": new_po.vendor_id, "matched_po_id": new_po.id, "total_amount": 100.00},
     )
 
     assert test_db_session.query(PurchaseOrder).filter_by(id=old_po.id).one().remaining_balance == 2500.00
@@ -84,6 +94,32 @@ def test_run_stage_events_are_live_and_persisted(test_db_session, monkeypatch, t
     assert len(progress_snapshots) == 1
     assert progress_snapshots[0][-1]["stage_name"] == "5. Extract document text"
     assert progress_snapshots[0][-1]["status"] == "RUNNING"
+
+
+def test_failed_workflow_persists_review_decision_and_audit_event(
+    test_db_session, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "STORAGE_DIR", tmp_path / "uploads")
+    settings.STORAGE_DIR.mkdir(parents=True)
+    monkeypatch.setattr(settings, "LLM_API_KEY", "")
+    orchestrator = WorkflowOrchestrator(test_db_session)
+
+    def fail_extraction(_document_text):
+        raise RuntimeError("provider unavailable")
+
+    orchestrator.extractor.llm_provider.extract_invoice = fail_extraction
+    invoice_bytes = (REPO_ROOT / "data/sample_data/scenario_1_clean_invoice.pdf").read_bytes()
+
+    with pytest.raises(WorkflowError, match="provider unavailable"):
+        orchestrator.process_invoice(invoice_bytes, "failing-invoice.pdf")
+
+    run = test_db_session.query(ProcessingRun).order_by(ProcessingRun.id.desc()).first()
+    invoice = test_db_session.query(Invoice).filter_by(id=run.invoice_id).one()
+    failure_audit = test_db_session.query(AuditLog).filter_by(run_id=run.id, action="WORKFLOW_FAILED").one()
+    assert run.execution_status == "FAILED"
+    assert run.final_decision == DecisionStatus.NEEDS_REVIEW.value
+    assert invoice.final_decision == DecisionStatus.NEEDS_REVIEW.value
+    assert "7. Extract structured invoice information" in failure_audit.details
 
 
 def test_invoice_is_blocked_if_po_balance_changes_before_reservation(

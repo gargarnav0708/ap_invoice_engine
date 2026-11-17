@@ -1,6 +1,5 @@
-"""
-Structured prompts for LLM-based Invoice Data Extraction.
-"""
+"""Structured prompts for LLM-based Invoice Data Extraction."""
+from copy import deepcopy
 
 SYSTEM_EXTRACTION_PROMPT = """You are an expert accounts payable (AP) invoice extraction system.
 Your task is to extract structured financial data from the provided invoice document text.
@@ -38,18 +37,42 @@ EXTRACTION_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "description": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}}, "required": ["value", "confidence"]},
-                    "quantity": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}}, "required": ["value", "confidence"]},
-                    "unit": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}}, "required": ["value", "confidence"]},
-                    "unit_price": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}}, "required": ["value", "confidence"]},
-                    "tax_amount": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}}, "required": ["value", "confidence"]},
-                    "line_total": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}}, "required": ["value", "confidence"]}
+                    "description": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": ["integer", "null"]}}, "required": ["value", "confidence"]},
+                    "quantity": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": ["integer", "null"]}}, "required": ["value", "confidence"]},
+                    "unit": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": ["integer", "null"]}}, "required": ["value", "confidence"]},
+                    "unit_price": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": ["integer", "null"]}}, "required": ["value", "confidence"]},
+                    "tax_amount": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": ["integer", "null"]}}, "required": ["value", "confidence"]},
+                    "line_total": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": ["integer", "null"]}}, "required": ["value", "confidence"]}
                 }
             }
         }
     },
     "required": ["vendor_name", "invoice_number", "total_amount", "currency", "line_items"]
 }
+
+
+def build_strict_extraction_schema() -> dict:
+    """Return a strict JSON Schema accepted by Groq structured outputs.
+
+    Groq requires every object property to be required. Nullable values express
+    optional document fields while keeping a stable response shape.
+    """
+    schema = deepcopy(EXTRACTION_JSON_SCHEMA)
+
+    def make_strict(node: dict) -> None:
+        if node.get("type") == "object":
+            properties = node.get("properties", {})
+            node["additionalProperties"] = False
+            node["required"] = list(properties)
+            for name, child in properties.items():
+                if name == "page" and child.get("type") == "integer":
+                    child["type"] = ["integer", "null"]
+                make_strict(child)
+        if node.get("type") == "array":
+            make_strict(node["items"])
+
+    make_strict(schema)
+    return schema
 
 
 def build_user_prompt(document_text: str) -> str:
