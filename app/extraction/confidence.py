@@ -24,8 +24,11 @@ def compute_evidence_ocr_confidence(evidence: Optional[str], words: List[Dict[st
     ocr_tokens = []
     for word in words:
         raw_text = str(word.get("text", ""))
+        raw_conf = word.get("confidence")
+        if raw_conf is None:
+            continue
         try:
-            confidence = float(word.get("confidence"))
+            confidence = float(raw_conf)
         except (TypeError, ValueError):
             continue
         for token in tokens(raw_text):

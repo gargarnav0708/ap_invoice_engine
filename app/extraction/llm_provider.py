@@ -99,8 +99,8 @@ class GroqProvider(BaseLLMProvider):
             configured_retry = int(settings.LLM_RETRY_MAX_COMPLETION_TOKENS)
             retry_budget = min(65536, max(configured_retry, initial_budget * 2))
 
-            def request(response_format: dict, budget: int):
-                parameters = {
+            def request(response_format: dict[str, Any], budget: int) -> Any:
+                parameters: dict[str, Any] = {
                     "model": self.model,
                     "messages": messages,
                     "response_format": response_format,
@@ -108,19 +108,30 @@ class GroqProvider(BaseLLMProvider):
                     "max_completion_tokens": budget,
                     "timeout": 45.0,
                 }
-                # Groq documents reasoning_effort for GPT-OSS. Low effort keeps
-                # extraction deterministic while reserving completion budget for JSON.
+                # Groq documents reasoning_effort and include_reasoning for GPT-OSS.
+                # Because the OpenAI Python SDK validates top-level keyword arguments on
+                # Completions.create(), provider-specific body fields like include_reasoning
+                # must be passed via extra_body.
                 if self.model.startswith("openai/gpt-oss-"):
                     effort = settings.LLM_REASONING_EFFORT
                     parameters["reasoning_effort"] = effort if effort in {"low", "medium", "high"} else "low"
-                    parameters["include_reasoning"] = False
+                    parameters["extra_body"] = {"include_reasoning": False}
                 try:
                     return completion.create(**parameters)
                 except Exception as error:
+                    err_lower = str(error).lower()
+                    if (
+                        getattr(error, "status_code", None) == 400
+                        and "include_reasoning" in err_lower
+                        and "extra_body" in parameters
+                    ):
+                        logger.warning("Provider rejected include_reasoning; retrying without extra_body.")
+                        parameters.pop("extra_body", None)
+                        return completion.create(**parameters)
                     if (
                         _is_completion_truncation(error)
                         or getattr(error, "status_code", None) != 400
-                        or "failed to validate json" not in str(error).lower()
+                        or "failed to validate json" not in err_lower
                         or response_format.get("type") != "json_schema"
                     ):
                         raise
@@ -248,30 +259,36 @@ class MockLLMProvider(BaseLLMProvider):
 
         # 6. Currency
         curr_val, curr_conf, curr_ev = None, 0.0, None
-        currency_code = re.search(r"\b(USD|EUR|GBP|CAD|AUD|NZD|HKD|JPY|CNY|INR)\b", document_text, re.IGNORECASE)
-        unique_symbols = (("€", "EUR"), ("£", "GBP"), ("₹", "INR"), ("US$", "USD"),
-                          ("HK$", "HKD"), ("CA$", "CAD"), ("A$", "AUD"), ("NZ$", "NZD"))
+        currency_code = re.search(r"\b(USD|EUR|GBP|CAD|AUD|NZD|HKD|SGD|AED|JPY|CNY|INR)\b", document_text, re.IGNORECASE)
+        unique_symbols = (
+            ("€", "EUR"), ("£", "GBP"), ("₹", "INR"), ("US$", "USD"),
+            ("HK$", "HKD"), ("CA$", "CAD"), ("A$", "AUD"), ("NZ$", "NZD"), ("S$", "SGD"),
+        )
         if currency_code:
             curr_val, curr_conf, curr_ev = currency_code.group(1).upper(), 0.95, currency_code.group(0)
         else:
             symbol_match = next(((symbol, code) for symbol, code in unique_symbols if symbol in document_text), None)
+            rs_match = re.search(r"\b(Rs\.?|Rupees?)\b", document_text, re.IGNORECASE)
             if symbol_match:
                 curr_ev, curr_val = symbol_match
                 curr_conf = 0.90
+            elif rs_match:
+                curr_ev, curr_val, curr_conf = rs_match.group(0), "INR", 0.90
             elif "$" in document_text:
-                # Bare dollar signs are ambiguous; do not silently assume USD.
+                # Bare dollar signs are preserved as evidence and resolved against PO/vendor context in the workflow.
                 curr_ev = "$"
 
         # 7. Financial Totals
+        curr_prefix = r"(?:[\$€£₹]|Rs\.?\s*|INR\s*|USD\s*|EUR\s*|GBP\s*)?"
         subtotal_val, subtotal_conf, subtotal_ev = None, 0.0, None
-        sub_match = re.search(r"Subtotal:?\s*[\n\r]*\s*[\$€£]?\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
+        sub_match = re.search(rf"Subtotal:?\s*[\n\r]*\s*{curr_prefix}\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if sub_match:
             subtotal_val = _parse_amount_token(sub_match.group(1))
             if subtotal_val is not None:
                 subtotal_conf, subtotal_ev = 0.95, sub_match.group(0)
 
         tax_val_amt, tax_amt_conf, tax_amt_ev = None, 0.0, None
-        tax_match = re.search(r"Tax(?:\s*\(\d+%\))?:?\s*[\n\r]*\s*[\$€£]?\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
+        tax_match = re.search(rf"(?:Tax|GST|IGST|CGST|VAT)(?:\s*\(\d+%\))?:?\s*[\n\r]*\s*{curr_prefix}\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if tax_match:
             tax_val_amt = _parse_amount_token(tax_match.group(1))
             if tax_val_amt is not None:
@@ -279,10 +296,10 @@ class MockLLMProvider(BaseLLMProvider):
 
         total_val, total_conf, total_ev = None, 0.0, None
         # Prioritize matching "Total Amount:"
-        total_match = re.search(r"Total\s*Amount:?\s*[\n\r]*\s*[\$€£]?\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
+        total_match = re.search(rf"Total\s*Amount:?\s*[\n\r]*\s*{curr_prefix}\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if not total_match:
             # Fall back to "Total:" but avoid single word column header "Total"
-            total_match = re.search(r"(?:Final\s*Total|Total\s*Due|Total):?\s*[\$€£]\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
+            total_match = re.search(rf"(?:Final\s*Total|Total\s*Due|Grand\s*Total|Total):?\s*(?:[\$€£₹]|Rs\.?|INR|USD|EUR|GBP)\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if total_match:
             total_val = _parse_amount_token(total_match.group(1))
             if total_val is not None:
@@ -293,7 +310,7 @@ class MockLLMProvider(BaseLLMProvider):
         for line in lines:
             # Table row format: ITEM: Industrial Safety Helmets | Qty: 20.0 | Price: $50.00 | Total: $1000.00
             table_match = re.search(
-                r"^ITEM:\s*([^|]+)\s*\|\s*Qty:\s*([\d.]+)\s*\|\s*Price:\s*[\$€£]?([\d,.]+)\s*\|\s*Total:\s*[\$€£]?([\d,.]+)",
+                rf"^ITEM:\s*([^|]+)\s*\|\s*Qty:\s*([\d.]+)\s*\|\s*Price:\s*{curr_prefix}([\d,.]+)\s*\|\s*Total:\s*{curr_prefix}([\d,.]+)",
                 line,
                 re.IGNORECASE
             )

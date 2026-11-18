@@ -1,74 +1,105 @@
 """
 Streamlit Dashboard View: Real-time AP metrics, KPIs, and Plotly visualisations.
-All metrics are dynamically calculated from the database.
+All metrics are dynamically calculated from the database, with spend reported in
+Indian Rupees (INR / ₹) via deterministic FX conversion.
 """
-import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+import streamlit as st
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, joinedload
 
-from app.database.entities import Invoice, ProcessingRun, Vendor
 from app.core.schemas import DecisionStatus
+from app.database.entities import Invoice, ProcessingRun, Vendor
+from app.database.queries import display_status_expression, status_counts
+from app.processing.currency import (
+    convert_to_inr,
+    format_inr,
+    get_usd_to_inr_rate,
+)
+from app.ui.components import render_kpis, render_table
+from app.ui.presentation import Kpi, invoice_display_status, status_meta
+from app.ui.theme import chart_color, current_theme, style_figure
 
 
 def render_dashboard(session: Session):
+    theme = current_theme()
+    usd_rate = get_usd_to_inr_rate()
     st.markdown("## 📊 AP Operations & Intelligence Dashboard")
-    st.caption("Live metrics derived from enterprise accounts payable processing pipeline.")
+    st.caption(
+        f"Live metrics derived from enterprise accounts payable processing pipeline "
+        f"(reporting currency: **INR ₹** · 1 USD = ₹{usd_rate:,.2f})."
+    )
 
-    # 1. Fetch live metrics from database
-    total_invoices = session.query(Invoice).count()
+    # 1. Live metrics (single grouped query for the status breakdown)
+    counts = status_counts(session)
+    total_invoices = sum(counts.values())
+    approved_count = counts.get(DecisionStatus.APPROVED.value, 0)
+    review_count = counts.get(DecisionStatus.NEEDS_REVIEW.value, 0)
+    blocked_count = counts.get(DecisionStatus.BLOCKED.value, 0)
+    failed_count = counts.get("FAILED", 0)
 
-    approved_count = session.query(Invoice).filter(
-        func.coalesce(Invoice.manual_override_decision, Invoice.final_decision) == DecisionStatus.APPROVED.value
-    ).count()
+    approved_expr = display_status_expression() == DecisionStatus.APPROVED.value
+    approved_rows = session.execute(
+        select(Invoice.total_amount, Invoice.currency, Vendor.legal_name)
+        .outerjoin(Vendor, Invoice.vendor_id == Vendor.id)
+        .where(approved_expr)
+    ).all()
 
-    review_count = session.query(Invoice).filter(
-        func.coalesce(Invoice.manual_override_decision, Invoice.final_decision) == DecisionStatus.NEEDS_REVIEW.value
-    ).count()
+    total_spend_inr = 0.0
+    vendor_spend_inr: dict[str, float] = {}
+    for amt, curr, v_name in approved_rows:
+        if amt is None:
+            continue
+        inr_val = convert_to_inr(float(amt), curr or "USD") or 0.0
+        total_spend_inr += inr_val
+        if v_name:
+            vendor_spend_inr[str(v_name)] = vendor_spend_inr.get(str(v_name), 0.0) + inr_val
 
-    blocked_count = session.query(Invoice).filter(
-        func.coalesce(Invoice.manual_override_decision, Invoice.final_decision) == DecisionStatus.BLOCKED.value
-    ).count()
+    avg_duration = session.execute(select(func.avg(ProcessingRun.duration_ms))).scalar() or 0.0
 
-    total_spend = session.query(func.sum(Invoice.total_amount)).filter(
-        func.coalesce(Invoice.manual_override_decision, Invoice.final_decision) == DecisionStatus.APPROVED.value
-    ).scalar() or 0.0
+    approval_rate = (approved_count / total_invoices * 100) if total_invoices else 0.0
+    attention = review_count + failed_count
+    exception_rate = (attention / total_invoices * 100) if total_invoices else 0.0
 
-    avg_duration = session.query(func.avg(ProcessingRun.duration_ms)).scalar() or 0.0
-
-    approval_rate = (approved_count / total_invoices * 100) if total_invoices > 0 else 0.0
-    exception_rate = (review_count / total_invoices * 100) if total_invoices > 0 else 0.0
-
-    # 2. Metric KPI Cards
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1:
-        st.metric("Total Invoices", f"{total_invoices:,}")
-    with col2:
-        st.metric("Approved", f"{approved_count}", delta=f"{approval_rate:.1f}% rate")
-    with col3:
-        st.metric("Needs Review", f"{review_count}", delta=f"{exception_rate:.1f}% rate", delta_color="inverse")
-    with col4:
-        st.metric("Blocked", f"{blocked_count}", delta_color="inverse")
-    with col5:
-        st.metric("Total Approved Spend", f"${total_spend:,.2f}")
-    with col6:
-        st.metric("Avg Speed", f"{avg_duration:.0f} ms")
+    # 2. Responsive KPI cards (auto-fit grid: 6 → 3 → 2 → 1 across as width shrinks)
+    render_kpis(
+        [
+            Kpi("Total invoices", f"{total_invoices:,}", tone="info"),
+            Kpi("Approved", f"{approved_count:,}", f"{approval_rate:.1f}% approval rate", "success"),
+            Kpi(
+                "Needs review",
+                f"{attention:,}",
+                f"{exception_rate:.1f}% exception rate"
+                + (f" · incl. {failed_count} failed" if failed_count else ""),
+                "warning",
+            ),
+            Kpi("Blocked", f"{blocked_count:,}", "Hard control failures", "danger"),
+            Kpi(
+                "Approved spend (INR)",
+                format_inr(total_spend_inr),
+                f"FX converted @ 1 USD = ₹{usd_rate:,.2f}",
+            ),
+            Kpi("Avg processing time", f"{avg_duration:,.0f} ms", "Mean pipeline duration"),
+        ],
+        label="AP processing key metrics",
+    )
 
     st.markdown("---")
 
-    # 3. Visualizations
+    # 3. Visualisations (columns stack automatically on narrow screens)
     col_chart1, col_chart2 = st.columns([1, 1])
 
     with col_chart1:
         st.subheader("Decision Breakdown")
         if total_invoices > 0:
-            status_df = pd.DataFrame([
-                {"Status": "Approved", "Count": approved_count, "Color": "#38A169"},
-                {"Status": "Needs Review", "Count": review_count, "Color": "#DD6B20"},
-                {"Status": "Blocked", "Count": blocked_count, "Color": "#E53E3E"},
-            ])
+            keys = [k for k in ("APPROVED", "NEEDS_REVIEW", "BLOCKED", "FAILED", "IN_PROGRESS") if counts.get(k)]
+            status_df = pd.DataFrame(
+                [
+                    {"Status": f"{status_meta(k).symbol} {status_meta(k).label}", "Count": counts[k], "key": k}
+                    for k in keys
+                ]
+            )
             fig_donut = px.pie(
                 status_df,
                 names="Status",
@@ -76,74 +107,105 @@ def render_dashboard(session: Session):
                 hole=0.55,
                 color="Status",
                 color_discrete_map={
-                    "Approved": "#38A169",
-                    "Needs Review": "#DD6B20",
-                    "Blocked": "#E53E3E"
-                }
+                    row["Status"]: chart_color(row["key"], theme) for _, row in status_df.iterrows()
+                },
             )
-            fig_donut.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
-            st.plotly_chart(fig_donut, use_container_width=True)
+            fig_donut.update_traces(textinfo="value+percent", textfont_size=13)
+            style_figure(fig_donut, theme, height=300)
+            st.plotly_chart(
+                fig_donut,
+                width="stretch",
+                theme=None,
+                config={"displayModeBar": False, "responsive": True},
+            )
         else:
             st.info("No invoice records in database yet. Process an invoice to view metrics.")
 
     with col_chart2:
-        st.subheader("Approved Spend by Vendor")
-        vendor_spend_query = session.query(
-            Vendor.legal_name,
-            func.sum(Invoice.total_amount).label("total_spend")
-        ).join(Invoice, Invoice.vendor_id == Vendor.id).filter(
-            func.coalesce(Invoice.manual_override_decision, Invoice.final_decision) == DecisionStatus.APPROVED.value
-        ).group_by(Vendor.legal_name).all()
-
-        if vendor_spend_query:
-            spend_df = pd.DataFrame(vendor_spend_query, columns=["Vendor", "Spend"])
+        st.subheader("Approved Spend by Vendor (INR ₹)")
+        if vendor_spend_inr:
+            sorted_spend = sorted(vendor_spend_inr.items(), key=lambda kv: kv[1], reverse=True)
+            spend_df = pd.DataFrame(sorted_spend, columns=["Vendor", "Spend (INR)"])
+            spend_df["VendorLabel"] = spend_df["Vendor"].apply(
+                lambda v: v if len(str(v)) <= 22 else str(v)[:20] + "…"
+            )
             fig_bar = px.bar(
                 spend_df,
-                x="Vendor",
-                y="Spend",
+                x="Spend (INR)",
+                y="VendorLabel",
+                orientation="h",
                 text_auto=".2s",
-                color_discrete_sequence=["#2B6CB0"]
+                hover_data={"Vendor": True, "VendorLabel": False, "Spend (INR)": ":,.2f"},
+                color_discrete_sequence=[chart_color("bar", theme)],
             )
-            fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
-            st.plotly_chart(fig_bar, use_container_width=True)
+            fig_bar.update_layout(
+                yaxis=dict(automargin=True, title=None),
+                xaxis=dict(title="Approved spend (INR ₹)"),
+            )
+            style_figure(fig_bar, theme, height=300)
+            st.plotly_chart(
+                fig_bar,
+                width="stretch",
+                theme=None,
+                config={"displayModeBar": False, "responsive": True},
+            )
         else:
             st.info("No approved invoice spend recorded yet.")
 
     st.markdown("---")
 
-    # 4. Recent Processing Activity Table
+    # 4. Recent processing activity (bounded to 10 rows)
     st.subheader("Recent Processing Runs")
-    recent_invoices = session.query(Invoice).order_by(Invoice.created_at.desc()).limit(10).all()
+    recent_invoices = (
+        session.execute(
+            select(Invoice)
+            .options(joinedload(Invoice.vendor))
+            .order_by(Invoice.created_at.desc(), Invoice.id.desc())
+            .limit(10)
+        )
+        .scalars()
+        .all()
+    )
 
     if recent_invoices:
         rows = []
         for inv in recent_invoices:
-            effective_dec = inv.manual_override_decision or inv.final_decision
-            vendor_name = inv.vendor.legal_name if inv.vendor else "Unknown / Unmatched"
-            rows.append({
-                "ID": inv.id,
-                "Filename": inv.original_filename,
-                "Vendor": vendor_name,
-                "Invoice #": inv.invoice_number or "N/A",
-                "Amount": (
-                    f"{inv.currency or 'Currency unconfirmed'} {inv.total_amount:.2f}"
-                    if inv.total_amount is not None else "N/A"
-                ),
-                "Confidence": f"{inv.extraction_confidence*100:.0f}%",
-                "Status": effective_dec,
-                "Processed At": inv.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            })
-
-        df_recent = pd.DataFrame(rows)
-        st.dataframe(
-            df_recent,
-            use_container_width=True,
-            column_config={
-                "Status": st.column_config.TextColumn(
-                    "Decision",
-                    help="Final or manually overridden status"
-                )
-            }
+            inr_eq = convert_to_inr(inv.total_amount, inv.currency or "USD") if inv.total_amount is not None else None
+            rows.append(
+                {
+                    "ID": inv.id,
+                    "Decision": invoice_display_status(
+                        inv.final_decision, inv.processing_status, inv.manual_override_decision
+                    ),
+                    "Vendor": inv.vendor.legal_name if inv.vendor else "Unknown / Unmatched",
+                    "Invoice #": inv.invoice_number or "N/A",
+                    "Native Amount": (
+                        f"{inv.currency or 'Unconfirmed'} {inv.total_amount:,.2f}"
+                        if inv.total_amount is not None
+                        else "N/A"
+                    ),
+                    "Amount (INR ₹)": format_inr(inr_eq),
+                    "Confidence": f"{(inv.extraction_confidence or 0) * 100:.0f}%",
+                    "Filename": inv.original_filename,
+                    "Processed (UTC)": inv.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        render_table(
+            rows,
+            [
+                "ID",
+                "Decision",
+                "Vendor",
+                "Invoice #",
+                "Native Amount",
+                "Amount (INR ₹)",
+                "Confidence",
+                "Filename",
+                "Processed (UTC)",
+            ],
+            caption="Ten most recently processed invoices (with INR converted amounts)",
+            column_kinds={"Decision": "status"},
+            numeric_columns=["ID", "Native Amount", "Amount (INR ₹)", "Confidence"],
         )
     else:
         st.caption("No invoices processed yet. Navigate to 'Upload Invoice' to begin.")

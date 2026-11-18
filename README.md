@@ -33,62 +33,88 @@ ap_invoice_engine/
 │   ├── main.py                # Streamlit application entry point & page router
 │   ├── config/
 │   │   ├── settings.py        # Environment variables & system directories
-│   │   └── rules.py           # Configurable thresholds, tolerances & rule policies
+│   │   ├── rules.py           # Configurable thresholds, tolerances & rule policies
+│   │   ├── persistence.py     # Durable DB persistence for rules, extraction mode & FX rate
+│   │   └── ui.py              # Pagination, polling, preview & test-runner constants
 │   ├── core/
 │   │   ├── schemas.py         # Pydantic schemas (ExtractedInvoice, RuleResult, etc.)
 │   │   └── exceptions.py      # Business exceptions vs Technical failures
 │   ├── ingestion/
-│   │   ├── pdf_loader.py      # PyMuPDF + pdfplumber text & table extraction
+│   │   ├── pdf_loader.py      # PyMuPDF + pdfplumber multi-page text & table extraction
 │   │   ├── document_classifier.py # Classifies MACHINE_READABLE, SCANNED, HYBRID
-│   │   └── ocr_engine.py      # Tesseract OCR abstraction with graceful fallback
+│   │   └── ocr_engine.py      # Tesseract OCR abstraction with word-level confidence
 │   ├── extraction/
 │   │   ├── extractor.py       # Extraction pipeline coordinator
 │   │   ├── llm_provider.py    # Groq provider & deterministic demo engine
 │   │   ├── extraction_prompts.py # Strict Pydantic JSON extraction prompts
-│   │   └── confidence.py      # Multi-factor confidence scoring
+│   │   └── confidence.py      # Multi-factor & evidence-snippet OCR confidence scoring
 │   ├── processing/
-│   │   ├── normalizer.py      # Normalizes company names, currencies, dates, IDs
-│   │   ├── vendor_matcher.py  # Tax ID exact match, normalized match, fuzzy scoring
-│   │   ├── po_matcher.py      # Exact PO reference, vendor-scoped candidate scoring
+│   │   ├── normalizer.py      # Normalizes company names, currencies (incl. INR/₹/Rs.), dates, IDs
+│   │   ├── currency.py        # Multi-currency resolution & FX conversion engine (USD ↔ INR)
+│   │   ├── probabilistic_matcher.py # Multi-signal probabilistic confidence engine (Vendors, POs, Lines)
+│   │   ├── vendor_matcher.py  # Probabilistic Tax ID, token-set, abbreviation & fuzzy vendor matcher
+│   │   ├── po_matcher.py      # Probabilistic PO reference, amount-fit & line-similarity matcher
 │   │   ├── duplicate_detector.py # 4-level duplicate detection engine
-│   │   ├── financial_validator.py # Arithmetic, tax, line sum, and PO balance validation
-│   │   └── line_item_matcher.py # Item description fuzzy match, price & qty variances
+│   │   ├── financial_validator.py # Arithmetic, chronology, tax, FX conversion & PO balance validation
+│   │   ├── line_item_matcher.py # Probabilistic item description match, FX price & qty variances
+│   │   └── exporter.py        # In-memory Generic CSV, Xero Bills CSV, QuickBooks CSV & Audit JSON
 │   ├── decision/
 │   │   ├── rules_engine.py    # Aggregates and runs all AP validation rules
 │   │   └── decision_service.py # Deterministic classification (APPROVED, NEEDS_REVIEW, BLOCKED)
 │   ├── database/
-│   │   ├── db.py              # SQLAlchemy engine, session management, SQLite pragmas
-│   │   ├── entities.py        # Relational models (Vendor, PO, Line Items, Invoices, Audits)
-│   │   └── repositories.py    # Transactional repositories with atomic PO balance updates
+│   │   ├── db.py              # SQLAlchemy engine, session management, SQLite/Postgres setup
+│   │   ├── entities.py        # Relational models (Vendor, PO, Line Items, Invoices, Audits, AppConfig)
+│   │   ├── types.py           # Timezone-aware UTCDateTime SQLAlchemy column adapter
+│   │   ├── repositories.py    # Transactional repositories with atomic PO balance updates
+│   │   ├── queries.py         # SQL filtering, counting & LIMIT/OFFSET pagination helpers
+│   │   ├── procurement_service.py # In-app Vendor & PO onboarding with probabilistic similarity guard
+│   │   └── maintenance.py     # Foreign-key-safe transactional reset service
 │   ├── workflow/
-│   │   ├── orchestrator.py    # 19-stage pipeline coordinator with rerun idempotency
+│   │   ├── orchestrator.py    # 19-stage pipeline coordinator with live persisted stage events
+│   │   ├── batch_runner.py    # Multi-invoice batch processor with per-document error isolation
+│   │   ├── stages.py          # Canonical 19-stage pipeline definitions
 │   │   └── execution_logger.py # Records execution trace, durations, and statuses
 │   ├── ui/
-│   │   ├── dashboard.py       # Live dynamic KPIs and Plotly charts
-│   │   ├── upload.py          # Drag-and-drop uploader & 1-click scenario runners
-│   │   ├── processing_view.py # 19-stage live execution trace inspector
-│   │   ├── invoice_history.py # Searchable and filterable invoice registry
-│   │   ├── invoice_details.py # Audit workbench, PDF preview, and manual override form
-│   │   └── settings_view.py   # Configurable tolerances and database maintenance
+│   │   ├── dashboard.py       # Responsive KPI grid & Plotly charts reported in Indian Rupees (INR ₹)
+│   │   ├── upload.py          # Single live-stream & multi-file batch uploader + 8 scenario runners
+│   │   ├── processing_view.py # Live auto-polling 19-stage execution trace inspector
+│   │   ├── invoice_history.py # SQL-paginated invoice registry with Xero/QuickBooks/CSV/JSON exports
+│   │   ├── invoice_details.py # Audit workbench, multi-page PDF viewer (zoom/rotate/highlight) & overrides
+│   │   ├── procurement_view.py # In-app Vendor & PO management + Probabilistic Matcher Simulator
+│   │   ├── settings_view.py   # Rule tolerances, extraction mode, USD→INR FX rate & local test runner
+│   │   ├── theme.py           # Session-scoped Light/Dark theme tokens & Plotly styling
+│   │   ├── presentation.py    # Accessible symbol+text status badges, KPI grid & HTML tables
+│   │   ├── components.py      # Reusable Streamlit pagination & status banner components
+│   │   ├── document_preview.py # Bounded single-page PDF/raster preview, rotation & text highlighting
+│   │   └── run_trace.py       # Resilient stage trace parser & active/stale polling controller
 │   └── utils/
-│       ├── file_storage.py    # Secure PDF storage and path sanitization
+│       ├── file_storage.py    # Secure PDF/image storage and path sanitization
 │       ├── hashing.py         # SHA-256 calculation utilities
+│       ├── time.py            # Timezone-aware UTC datetime helpers
 │       └── logging.py         # Standardized application logging
 ├── data/
 │   ├── uploads/               # Secure uploaded file storage
-│   └── sample_data/           # Synthetic test PDF fixtures
+│   └── sample_data/           # Synthetic test PDF/image fixtures
+├── docs/
+│   └── screenshots/           # Verified desktop & mobile Light/Dark UI screenshots
 ├── scripts/
 │   ├── seed_database.py       # Seeds 5 vendors, 10 POs, and line items
 │   └── generate_test_invoices.py # Generates 8 PDF/image scenario fixtures
 └── tests/
     ├── conftest.py            # Isolated in-memory SQLite fixtures
-    ├── test_ingestion.py      # PDF classification, text extraction, OCR abstraction
-    ├── test_extraction.py     # Schema validation, missing fields, confidence scoring
+    ├── fixtures/              # Multi-page PDF & low-resolution raster test fixtures
+    ├── test_foundations.py    # UTC timestamps, DB reset safety, persisted rules & credential gating
+    ├── test_db_migrations.py  # Non-destructive schema migration tests
+    ├── test_ingestion.py      # PDF classification, multi-page table extraction, OCR abstraction
+    ├── test_ocr_confidence.py # Evidence-snippet OCR word confidence scoring
+    ├── test_extraction.py     # Schema validation, Groq structured output, retry & confidence scoring
     ├── test_matching.py       # Vendor, PO, and line-item matching
     ├── test_duplicates.py     # 4-level duplicate detection
     ├── test_financial_validation.py # Math, tax, currency, and PO balance overbilling
     ├── test_decisions.py      # Decision classification & explainability
-    └── test_workflow.py       # End-to-end orchestration, atomic updates, human overrides
+    ├── test_safety_and_progress.py # Atomic PO reservation, live stage persistence & failure handling
+    ├── test_workflow.py       # End-to-end orchestration, atomic updates, human overrides
+    └── test_phase2_ui_and_queries.py # SQL pagination, live trace, PDF preview, FX, probabilistic matcher & exports
 ```
 
 ---
@@ -217,14 +243,42 @@ PYTHONPATH=. python3 scripts/generate_test_invoices.py
 
 ---
 
-## 6. Running the Application
+## 6. Running the Application (VS Code & Terminal)
 
-Launch the Streamlit web dashboard:
+Launch the Streamlit web dashboard directly from the integrated VS Code terminal (the entry point automatically adds the repository root to `sys.path`):
 
 ```bash
-PYTHONPATH=. python3 -m streamlit run app/main.py
+# Activate virtual environment
+source .venv/bin/activate
+
+# Start the Streamlit application
+streamlit run app/main.py
 ```
 Open your browser to: **`http://localhost:8501`**
+
+### Phase 2 UI/UX & Operational Features
+- **Responsive Layout (`1440px` desktop, `768px` tablet, `390px` mobile):** Six KPI cards use an auto-fit CSS grid (`ap-kpi-grid`) that wraps cleanly from 6 across on wide screens to 3 or 2 across on narrow viewports without clipping or horizontal overflow. Tables sit inside keyboard-focusable horizontal scroll regions (`ap-table-wrap`).
+- **Session-Scoped Light / Dark Theme Selector:** Toggle between `☀️ Light` and `🌙 Dark` in the sidebar. The preference is stored strictly in `st.session_state` per browser session; `.streamlit/config.toml` remains the read-only startup default and is never rewritten at runtime.
+- **Database-Backed Pagination (`LIMIT` / `OFFSET`):** Both **Invoice History** and the **Invoice Details** selector filter and count in SQL (`app/database/queries.py`) with deterministic `created_at DESC, id DESC` ordering, configurable page sizes (`10`, `25`, `50`), Previous/Next controls, and automatic page reset when search/filter criteria change.
+- **Live Persisted Processing Timeline:** **Live Processing View** bounds the run selector to the 25 most recent runs, queries the selected run directly by primary key, and uses `st.fragment(run_every=2.0)` to auto-refresh `RUNNING` runs until they reach `SUCCESS` or `FAILED` (or pause if stale beyond 15 minutes). Malformed or missing stage JSON degrades gracefully without crashing.
+- **Bounded Document Preview with Page, Zoom, Rotation & Visual Highlighting:** **Invoice Details** renders only the selected PDF page at a bounded DPI (`50%–200%` zoom, `0°/90°/180°/270°` rotation), preserves the selected page while inspecting the same invoice, clamps/resets page state when switching invoices, and supports optional translucent bounding-box highlighting of extracted field values and custom search text directly on the PDF page. Raster images render without PDF-only page controls, and missing files clearly explain Render's temporary `/tmp` storage behavior.
+- **Accessible Status Presentation:** `APPROVED` (`✓`), `NEEDS_REVIEW` (`!`), `BLOCKED` (`✕`), and `FAILED` (`✕ Failed · needs review`) always combine symbol + text label + semantic tone across the dashboard, history, upload decision card, live processing view, and invoice details. Failed runs are always presented as failed and needing review, never as in-progress.
+- **Batch Multi-Invoice Upload & Accounting Exports:** Upload a single file for the 19-stage live stream, or select multiple files in **Upload Invoice** to run a batch job with per-document error isolation (`app/workflow/batch_runner.py`). Export filtered pages or individual audited invoices to **Generic Audit CSV**, **Xero Bills CSV**, **QuickBooks Online CSV**, or **Audit JSON** (`app/processing/exporter.py`).
+- **In-App Vendors & Purchase Orders Management (`Vendors & Purchase Orders`):** Register new vendors (with Tax ID / GSTIN, country, address, bank account, and approval status), toggle vendor approval status, and create new Purchase Orders with multi-row line items in **Indian Rupees (`INR ₹`)**, **US Dollars (`USD $`)**, or any supported currency (`app/ui/procurement_view.py`).
+- **Probabilistic Multi-Signal Vendor & PO Confidence Engine (`app/processing/probabilistic_matcher.py`):** Matches differently formatted vendor names (expanding abbreviations like `Ind.` → `Industrial`, `Supp.` → `Supplies`, stripping honorifics like `M/s`, and combining order-invariant token Dice, token containment, character similarity, and OCR-canonical Tax ID/GSTIN matching) and differently formatted PO references (`P.O. #2026/01` ↔ `PO-2026-001`, leading-zero normalization, OCR look-alike canonicalization, FX-converted amount closeness, and line-item similarity). Includes an interactive **🎯 Probabilistic Matcher & Confidence Simulator** tab inside **Vendors & Purchase Orders**.
+- **Indian Rupee (`INR ₹`) Reporting & Cross-Currency FX Conversion (`app/processing/currency.py`):** Recognizes `INR`, `₹`, `Rs.`, `Rupees`, and `GST`/`IGST`/`CGST` labels natively, automatically confirms `$` against matched PO/vendor context, converts approved spend across currencies into **`INR (₹)`** on the **Overview Dashboard**, displays native + `INR` equivalents across views, and converts cross-currency invoices (`USD` ↔ `INR`) against matched Purchase Orders at a configurable `USD → INR` exchange rate in **Settings & Rules**.
+- **Local-Only Developer Test Runner:** In `development` and `test` environments (when not running on Render or cloud platforms), **Settings & Rules** exposes a guarded `🧪 Run Automated Test Suite (pytest -q)` button that runs `[sys.executable, "-m", "pytest", "-q"]` with `shell=False`, a timeout, and capped output.
+
+### Verified UI Screenshots
+
+| View & Viewport | Screenshot |
+|---|---|
+| **Overview Dashboard (`1440px`, Light)** | ![Dashboard 1440 Light](docs/screenshots/dashboard_1440_light.png) |
+| **Overview Dashboard (`1440px`, Dark)** | ![Dashboard 1440 Dark](docs/screenshots/dashboard_1440_dark.png) |
+| **Overview Dashboard (`390px` Mobile, Light & Dark)** | ![Dashboard 390 Light](docs/screenshots/dashboard_390_light.png) ![Dashboard 390 Dark](docs/screenshots/dashboard_390_dark.png) |
+| **Invoice History & SQL Pagination (`1440px`, Light)** | ![History 1440 Light](docs/screenshots/history_1440_light.png) |
+| **Live Processing View (`1440px`, Light)** | ![Live Processing 1440 Light](docs/screenshots/live_processing_1440_light.png) |
+| **Invoice Details & PDF Preview (`1440px`, Light)** | ![Invoice Details 1440 Light](docs/screenshots/invoice_details_1440_light.png) |
 
 Upload a PDF or PNG, JPEG, TIFF, or BMP invoice image (or use the **Quick Test Scenarios** tab). Images are OCR'd through the configured OCR engine and then follow the same extraction, validation, and review process as PDFs. Each run streams
 its 19 stages live as they execute and ends with a reasoned **decision card**
@@ -314,6 +368,10 @@ The tests cover:
 - End-to-end workflow execution, atomic PO deductions, and human reviewer overrides
 - Raster image validation and OCR fallback to human review
 - Persisted live stage updates, conditional PO reservations, and corrected approval reconciliation
+- SQL-backed invoice pagination, filter counts, page boundary clamping, and deterministic timestamp tie-breaking
+- Live Processing View trace parsing, malformed JSON resilience, and terminal vs. active polling behavior
+- Bounded single-page PDF preview rendering, zoom-to-DPI capping, rotation, on-page text highlighting, and missing-file explanations
+- Multi-format accounting exports (Generic CSV, Xero Bills CSV, QuickBooks Online CSV, Audit JSON), batch upload error isolation, and chronological due-date validation (`RULE_DUE_DATE_CHRONOLOGY`)
 
 ---
 

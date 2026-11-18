@@ -12,9 +12,12 @@ from app.utils.logging import get_logger
 logger = get_logger("normalizer")
 
 LEGAL_SUFFIXES = [
+    r"\bpvt(?:\.|\b)",
+    r"\bprivate\b",
     r"\binc(?:\.|\b)",
     r"\bllc(?:\.|\b)",
     r"\bltd(?:\.|\b)",
+    r"\blimited\b",
     r"\bcorp(?:\.|\b)",
     r"\bcorporation\b",
     r"\bco(?:\.|\b)",
@@ -39,20 +42,26 @@ def normalize_vendor_name(name: Optional[str]) -> str:
 
 
 def normalize_currency(curr: Optional[str]) -> Optional[str]:
-    """Standardizes currency only when the source unambiguously identifies it."""
+    """Standardizes currency codes and symbols (including INR / ₹ / Rs.)."""
     if not curr:
         return None
     curr_upper = curr.strip().upper()
     mapping = {
-        "US$": "USD", "USD": "USD",
-        "€": "EUR", "EUR": "EUR",
+        "US$": "USD", "USD": "USD", "US DOLLAR": "USD", "US DOLLARS": "USD",
+        "€": "EUR", "EUR": "EUR", "EURO": "EUR", "EUROS": "EUR",
         "£": "GBP", "GBP": "GBP",
         "HK$": "HKD", "HKD": "HKD", "CA$": "CAD", "CAD": "CAD",
         "A$": "AUD", "AUD": "AUD", "NZ$": "NZD", "NZD": "NZD",
-        "JPY": "JPY", "CNY": "CNY", "INR": "INR", "₹": "INR",
+        "S$": "SGD", "SGD": "SGD", "AED": "AED",
+        "JPY": "JPY", "CNY": "CNY",
+        "INR": "INR", "₹": "INR", "RS": "INR", "RS.": "INR",
+        "RE": "INR", "RE.": "INR", "RUPEE": "INR", "RUPEES": "INR",
+        "INDIAN RUPEE": "INR", "INDIAN RUPEES": "INR",
     }
     if curr_upper in mapping:
         return mapping[curr_upper]
+    if "₹" in curr_upper or re.fullmatch(r"RS\.?|INR\s*₹?", curr_upper):
+        return "INR"
     return curr_upper if re.fullmatch(r"[A-Z]{3}", curr_upper) else None
 
 

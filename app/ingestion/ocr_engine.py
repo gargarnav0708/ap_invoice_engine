@@ -2,7 +2,7 @@
 OCR engine abstraction supporting Tesseract and cloud OCR pluggability.
 """
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, List, Optional
 from PIL import Image, ImageOps
 import io
 import shutil
@@ -120,9 +120,9 @@ class TesseractOCREngine(BaseOCREngine):
                     config=f"--oem 3 --psm {psm}",
                     output_type=self.pytesseract.Output.DICT,
                 )
-                lines = {}
-                confidences = []
-                words = []
+                lines: dict[tuple[Any, ...], list[str]] = {}
+                confidences: list[float] = []
+                words: list[dict[str, Any]] = []
                 for idx, raw_word in enumerate(data.get("text", [])):
                     word = raw_word.strip()
                     if not word:

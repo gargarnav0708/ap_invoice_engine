@@ -1,15 +1,15 @@
 """
-Vendor matching engine: Exact tax ID, exact normalized name, and fuzzy matching.
+Vendor matching engine: probabilistic multi-signal matching across Tax IDs/GSTINs,
+normalized company names, token sets, abbreviations, and fuzzy similarity.
 """
 from typing import List, Optional, Tuple
-from difflib import SequenceMatcher
 from sqlalchemy.orm import Session
 
+from app.config.rules import rules_config
+from app.core.schemas import NormalizedInvoice, VendorMatchCandidate
 from app.database.entities import Vendor
 from app.database.repositories import VendorRepository
-from app.core.schemas import VendorMatchCandidate, NormalizedInvoice
-from app.config.rules import rules_config
-from app.processing.normalizer import normalize_vendor_name
+from app.processing.probabilistic_matcher import score_vendor_similarity
 from app.utils.logging import get_logger
 
 logger = get_logger("vendor_matcher")
@@ -19,85 +19,72 @@ class VendorMatcher:
     def __init__(self, session: Session):
         self.repo = VendorRepository(session)
 
-    def match_vendor(self, invoice: NormalizedInvoice) -> Tuple[Optional[Vendor], List[VendorMatchCandidate], float, str]:
+    def match_vendor(
+        self, invoice: NormalizedInvoice
+    ) -> Tuple[Optional[Vendor], List[VendorMatchCandidate], float, str]:
         """
-        Matches vendor based on normalized invoice.
+        Matches vendor based on normalized invoice using probabilistic confidence scoring.
         Returns:
             (best_matched_vendor, all_candidates, match_score, match_status)
             match_status: 'CONFIDENT_MATCH', 'AMBIGUOUS_MATCH', 'NO_MATCH'
         """
-        candidates: List[VendorMatchCandidate] = []
         all_vendors = self.repo.get_all()
-
         if not all_vendors:
             logger.warning("No vendors registered in database.")
             return None, [], 0.0, "NO_MATCH"
 
-        # 1. Exact Tax ID Match
-        if invoice.vendor_tax_id:
-            tax_match = self.repo.get_by_tax_id(invoice.vendor_tax_id)
-            if tax_match:
-                cand = VendorMatchCandidate(
-                    vendor_id=tax_match.id,
-                    legal_name=tax_match.legal_name,
-                    match_type="exact_tax_id",
-                    score=1.0,
-                    explanation=f"Exact match on Tax ID: {tax_match.tax_id}",
-                    is_approved=tax_match.is_approved
-                )
-                logger.info(f"Vendor matched on exact Tax ID: {tax_match.legal_name}")
-                return tax_match, [cand], 1.0, "CONFIDENT_MATCH"
+        candidates: List[VendorMatchCandidate] = []
+        query_name = invoice.vendor_name or invoice.normalized_vendor_name
+        query_tax = invoice.vendor_tax_id
 
-        # 2. Exact Normalized Name Match
-        norm_name = invoice.normalized_vendor_name
-        if norm_name:
-            for v in all_vendors:
-                if v.normalized_name == norm_name:
-                    cand = VendorMatchCandidate(
+        for v in all_vendors:
+            bd = score_vendor_similarity(
+                query_name=query_name,
+                vendor_legal_name=v.legal_name,
+                vendor_normalized_name=v.normalized_name,
+                query_tax_id=query_tax,
+                vendor_tax_id=v.tax_id,
+            )
+            if bd.score >= rules_config.matching.VENDOR_REVIEW_THRESHOLD:
+                candidates.append(
+                    VendorMatchCandidate(
                         vendor_id=v.id,
                         legal_name=v.legal_name,
-                        match_type="exact_name",
-                        score=1.0,
-                        explanation="Exact match on normalized company name",
-                        is_approved=v.is_approved
+                        match_type=bd.match_type,
+                        score=bd.score,
+                        explanation=bd.explanation,
+                        is_approved=v.is_approved,
                     )
-                    logger.info(f"Vendor matched on exact normalized name: {v.legal_name}")
-                    return v, [cand], 1.0, "CONFIDENT_MATCH"
+                )
 
-        # 3. Fuzzy Name Matching across all vendors
-        if norm_name:
-            for v in all_vendors:
-                ratio = SequenceMatcher(None, norm_name, v.normalized_name).ratio()
-                if ratio >= rules_config.matching.VENDOR_REVIEW_THRESHOLD:
-                    candidates.append(
-                        VendorMatchCandidate(
-                            vendor_id=v.id,
-                            legal_name=v.legal_name,
-                            match_type="fuzzy_name",
-                            score=round(ratio, 3),
-                            explanation=f"Fuzzy name similarity of {ratio*100:.1f}%",
-                            is_approved=v.is_approved
-                        )
-                    )
-
-        # Sort candidates descending by score
         candidates.sort(key=lambda x: x.score, reverse=True)
 
         if not candidates:
-            logger.info(f"No vendor matched for name: '{invoice.vendor_name}'")
+            logger.info(f"No vendor matched for name='{invoice.vendor_name}', tax_id='{query_tax}'")
             return None, [], 0.0, "NO_MATCH"
 
         top_cand = candidates[0]
         top_vendor = self.repo.get_by_id(top_cand.vendor_id)
 
-        # Check for ambiguity: multiple close candidates
+        # Deterministic fast-path when Tax ID or normalized name is an exact 100% match
+        if top_cand.match_type in {"exact_tax_id", "exact_name"} and top_cand.score >= 0.999:
+            logger.info(f"Vendor matched with 100% confidence ({top_cand.match_type}): {top_cand.legal_name}")
+            return top_vendor, candidates, top_cand.score, "CONFIDENT_MATCH"
+
+        # Ambiguity check: two different vendors have very close probabilistic scores
         if len(candidates) > 1:
             second_cand = candidates[1]
-            if (top_cand.score - second_cand.score) < 0.08 and top_cand.score < 0.95:
-                logger.warning(f"Ambiguous vendor match: '{top_cand.legal_name}' vs '{second_cand.legal_name}'")
+            if (top_cand.score - second_cand.score) < 0.08 and top_cand.score < 0.96:
+                logger.warning(
+                    f"Ambiguous probabilistic vendor match: '{top_cand.legal_name}' ({top_cand.score:.2f}) "
+                    f"vs '{second_cand.legal_name}' ({second_cand.score:.2f})"
+                )
                 return top_vendor, candidates, top_cand.score, "AMBIGUOUS_MATCH"
 
         if top_cand.score >= rules_config.matching.VENDOR_HIGH_CONFIDENCE_THRESHOLD:
+            logger.info(
+                f"Vendor matched probabilistically ({top_cand.score * 100:.1f}%): {top_cand.legal_name}"
+            )
             return top_vendor, candidates, top_cand.score, "CONFIDENT_MATCH"
 
         return top_vendor, candidates, top_cand.score, "AMBIGUOUS_MATCH"

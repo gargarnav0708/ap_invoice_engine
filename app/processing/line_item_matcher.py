@@ -7,6 +7,8 @@ from difflib import SequenceMatcher
 from app.database.entities import PurchaseOrder, POLineItem
 from app.core.schemas import NormalizedInvoice, LineItemMatch
 from app.config.rules import rules_config
+from app.processing.currency import convert_amount
+from app.processing.probabilistic_matcher import score_description_similarity
 from app.utils.logging import get_logger
 
 logger = get_logger("line_item_matcher")
@@ -47,17 +49,25 @@ class LineItemMatcher:
             explanation = "No matching PO line item."
 
             inv_desc = inv_item.description.lower().strip()
+            inv_price_in_po_curr = (
+                convert_amount(inv_item.unit_price, invoice.currency, po.currency)
+                if invoice.currency and po.currency and invoice.currency != po.currency
+                else inv_item.unit_price
+            )
 
             for po_line in po_lines:
                 po_desc = po_line.description.lower().strip()
 
-                # Description similarity
-                desc_sim = SequenceMatcher(None, inv_desc, po_desc).ratio()
+                # Probabilistic description similarity (token overlap + abbreviations + char ratio)
+                desc_sim = max(
+                    SequenceMatcher(None, inv_desc, po_desc).ratio(),
+                    score_description_similarity(inv_item.description, po_line.description),
+                )
 
-                # Unit price closeness
+                # Unit price closeness (evaluated in PO currency)
                 price_match = 0.0
                 if po_line.unit_price > 0:
-                    diff_pct = abs(inv_item.unit_price - po_line.unit_price) / po_line.unit_price
+                    diff_pct = abs(inv_price_in_po_curr - po_line.unit_price) / po_line.unit_price
                     if diff_pct <= rules_config.matching.LINE_ITEM_PRICE_TOLERANCE_PCT:
                         price_match = 0.30
                     elif diff_pct <= 0.10:
@@ -71,7 +81,7 @@ class LineItemMatcher:
                     best_po_line = po_line
 
             if best_po_line and best_score >= rules_config.matching.LINE_ITEM_DESCRIPTION_SIMILARITY_THRESHOLD:
-                price_diff = round(inv_item.unit_price - best_po_line.unit_price, 2)
+                price_diff = round(inv_price_in_po_curr - best_po_line.unit_price, 2)
                 qty_diff = round(inv_item.quantity - best_po_line.quantity, 2)
 
                 notes = []

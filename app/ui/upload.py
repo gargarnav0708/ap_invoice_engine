@@ -7,36 +7,17 @@ import io
 from typing import Any
 
 import streamlit as st
-from sqlalchemy.orm import Session
 from PIL import Image
+from sqlalchemy.orm import Session
 
 from app.config.settings import settings
-from app.workflow.orchestrator import WorkflowOrchestrator
 from app.ingestion.ocr_engine import get_ocr_engine
-
-
-# Canonical ordered list of the 19 pipeline stages, shown greyed-out before they run.
-PIPELINE_STAGES = [
-    "1. Receive invoice",
-    "2. Validate uploaded file",
-    "3. Calculate file hash",
-    "4. Check for exact duplicate",
-    "5. Extract document text",
-    "6. Run OCR when necessary",
-    "7. Extract structured invoice information",
-    "8. Validate extracted schema",
-    "9. Normalise extracted fields",
-    "10. Match vendor",
-    "11. Match purchase order",
-    "12. Detect duplicate invoices",
-    "13. Match line items",
-    "14. Run financial validation",
-    "15. Run PO balance validation",
-    "16. Generate final decision",
-    "17. Save all results",
-    "18. Update invoice and PO records",
-    "19. Generate the final audit report",
-]
+from app.processing.currency import convert_to_inr, format_inr, format_native_and_inr
+from app.ui.components import render_kpis, render_status_banner, render_table
+from app.ui.presentation import Kpi, badge_html, invoice_display_status, status_meta
+from app.workflow.batch_runner import run_invoice_batch
+from app.workflow.orchestrator import WorkflowOrchestrator
+from app.workflow.stages import PIPELINE_STAGES
 
 _STATUS_ICON = {
     "PENDING": "⚪",
@@ -48,79 +29,144 @@ _STATUS_ICON = {
 
 def render_upload(session: Session):
     st.markdown("## 📥 Ingest & Process Invoices")
-    st.caption("Upload vendor PDF or image invoices for OCR, AI extraction, 3-way PO matching, and deterministic validation.")
+    st.caption(
+        "Upload vendor PDF or image invoices for OCR, AI extraction, 3-way PO matching, and deterministic validation."
+    )
 
     orchestrator = WorkflowOrchestrator(session)
 
     # The dataset tab is opt-in so opening the app never triggers a dataset download.
-    tab_upload, tab_scenarios, tab_dataset = st.tabs([
-        "Upload Document",
-        "Quick Test Scenarios (1-Click)",
-        "OCR Dataset Check",
-    ])
+    tab_upload, tab_scenarios, tab_dataset = st.tabs(
+        [
+            "Upload Document",
+            "Quick Test Scenarios (1-Click)",
+            "OCR Dataset Check",
+        ]
+    )
 
     with tab_upload:
-        st.subheader("Upload Invoice Document")
-        uploaded_file = st.file_uploader(
-            "Choose a PDF or invoice image",
+        st.subheader("Upload Invoice Document(s)")
+        uploaded_files = st.file_uploader(
+            "Choose one or more PDF or invoice image files (batch processing supported)",
             type=["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+            accept_multiple_files=True,
         )
 
-        if uploaded_file is not None:
-            col_info1, col_info2 = st.columns(2)
-            with col_info1:
-                st.write(f"**Filename:** `{uploaded_file.name}`")
-            with col_info2:
-                st.write(f"**File Size:** `{len(uploaded_file.getvalue()) / 1024:.1f} KB`")
+        if uploaded_files:
+            if len(uploaded_files) == 1:
+                single = uploaded_files[0]
+                col_info1, col_info2 = st.columns(2)
+                with col_info1:
+                    st.write(f"**Filename:** `{single.name}`")
+                with col_info2:
+                    st.write(f"**File Size:** `{len(single.getvalue()) / 1024:.1f} KB`")
 
-            if st.button("🚀 Process Invoice Now", type="primary", use_container_width=True):
-                _run_with_live_view(
-                    orchestrator,
-                    file_bytes=uploaded_file.getvalue(),
-                    filename=uploaded_file.name,
-                    title=uploaded_file.name,
+                if st.button("🚀 Process Invoice Now", type="primary", width="stretch"):
+                    _run_with_live_view(
+                        orchestrator,
+                        file_bytes=single.getvalue(),
+                        filename=single.name,
+                        title=single.name,
+                    )
+            else:
+                total_kb = sum(len(f.getvalue()) for f in uploaded_files) / 1024.0
+                st.write(
+                    f"**Selected Batch:** `{len(uploaded_files)}` documents (`{total_kb:.1f} KB` total) — "
+                    "processed with per-document error isolation."
                 )
+                if st.button(
+                    f"🚀 Process Batch ({len(uploaded_files)} Invoices)",
+                    type="primary",
+                    width="stretch",
+                ):
+                    _run_batch_upload(
+                        orchestrator,
+                        [(f.name, f.getvalue()) for f in uploaded_files],
+                    )
 
     with tab_scenarios:
         st.subheader("Run Verified Case Study Scenarios")
         st.write("Demonstrate the core AP engine capabilities on synthetic benchmark fixtures:")
 
         scenarios = [
-            ("Scenario 1: Clean Invoice",
-             "Approved vendor ('Acme Industrial Supplies'), valid PO ('PO-2026-001'), matching line items and math.",
-             "APPROVED", "scenario_1_clean_invoice.pdf", "btn_s1"),
-            ("Scenario 2: Duplicate Invoice",
-             "Re-submission of the identical clean invoice file / invoice number.",
-             "BLOCKED (Confirmed Duplicate)", "scenario_2_duplicate_invoice.pdf", "btn_s2"),
-            ("Scenario 3: Split PO Overbilling",
-             "PO-2026-002 has only $500 remaining balance. Invoice bills $1,100, exceeding available balance.",
-             "BLOCKED (PO Balance Exceeded)", "scenario_3_split_overbilling.pdf", "btn_s3"),
-            ("Scenario 4: Incomplete / Unreadable Invoice",
-             "Document missing invoice number, PO reference, and clear tax arithmetic.",
-             "NEEDS_REVIEW (Missing Critical Fields)", "scenario_4_incomplete_invoice.pdf", "btn_s4"),
-            ("Scenario 5: Low-Quality Scan",
-             "A blurred raster scan of an incomplete invoice exercises image OCR and safe review.",
-             "NEEDS_REVIEW (OCR / Missing Fields)", "scenario_5_scanned_low_quality.png", "btn_s5"),
-            ("Scenario 6: Ambiguous PO",
-             "Known vendor with no PO reference and multiple plausible open orders.",
-             "NEEDS_REVIEW (Ambiguous PO)", "scenario_6_ambiguous_po.pdf", "btn_s6"),
-            ("Scenario 7: Changed-PDF Near Duplicate",
-             "Same vendor and amount within seven days, but a different file and invoice number. Run Scenario 1 first.",
-             "NEEDS_REVIEW (Potential Duplicate)", "scenario_7_changed_pdf_near_duplicate.pdf", "btn_s7"),
-            ("Scenario 8: Small Tolerance Variance",
-             "A $0.04 arithmetic variance and 0.5% unit-price delta stay within configured tolerances.",
-             "APPROVED (Within Tolerance)", "scenario_8_small_tolerance_variance.pdf", "btn_s8"),
+            (
+                "Scenario 1: Clean Invoice",
+                "Approved vendor ('Acme Industrial Supplies'), valid PO ('PO-2026-001'), matching line items and math.",
+                "APPROVED",
+                "APPROVED",
+                "scenario_1_clean_invoice.pdf",
+                "btn_s1",
+            ),
+            (
+                "Scenario 2: Duplicate Invoice",
+                "Re-submission of the identical clean invoice file / invoice number.",
+                "BLOCKED",
+                "BLOCKED (Confirmed Duplicate)",
+                "scenario_2_duplicate_invoice.pdf",
+                "btn_s2",
+            ),
+            (
+                "Scenario 3: Split PO Overbilling",
+                "PO-2026-002 has only $500 remaining balance. Invoice bills $1,100, exceeding available balance.",
+                "BLOCKED",
+                "BLOCKED (PO Balance Exceeded)",
+                "scenario_3_split_overbilling.pdf",
+                "btn_s3",
+            ),
+            (
+                "Scenario 4: Incomplete / Unreadable Invoice",
+                "Document missing invoice number, PO reference, and clear tax arithmetic.",
+                "NEEDS_REVIEW",
+                "NEEDS_REVIEW (Missing Critical Fields)",
+                "scenario_4_incomplete_invoice.pdf",
+                "btn_s4",
+            ),
+            (
+                "Scenario 5: Low-Quality Scan",
+                "A blurred raster scan of an incomplete invoice exercises image OCR and safe review.",
+                "NEEDS_REVIEW",
+                "NEEDS_REVIEW (OCR / Missing Fields)",
+                "scenario_5_scanned_low_quality.png",
+                "btn_s5",
+            ),
+            (
+                "Scenario 6: Ambiguous PO",
+                "Known vendor with no PO reference and multiple plausible open orders.",
+                "NEEDS_REVIEW",
+                "NEEDS_REVIEW (Ambiguous PO)",
+                "scenario_6_ambiguous_po.pdf",
+                "btn_s6",
+            ),
+            (
+                "Scenario 7: Changed-PDF Near Duplicate",
+                "Same vendor and amount within seven days, but a different file and invoice number. Run Scenario 1 first.",
+                "NEEDS_REVIEW",
+                "NEEDS_REVIEW (Potential Duplicate)",
+                "scenario_7_changed_pdf_near_duplicate.pdf",
+                "btn_s7",
+            ),
+            (
+                "Scenario 8: Small Tolerance Variance",
+                "A $0.04 arithmetic variance and 0.5% unit-price delta stay within configured tolerances.",
+                "APPROVED",
+                "APPROVED (Within Tolerance)",
+                "scenario_8_small_tolerance_variance.pdf",
+                "btn_s8",
+            ),
         ]
 
-        st.caption("For a repeatable demo, start with a fresh disposable database. Run Scenario 1 before Scenario 7 to establish the first invoice for near-duplicate comparison.")
+        st.caption(
+            "For a repeatable demo, start with a fresh disposable database. "
+            "Run Scenario 1 before Scenario 7 to establish the first invoice for near-duplicate comparison."
+        )
         col1, col2 = st.columns(2)
-        for idx, (name, desc, expected, filename, key) in enumerate(scenarios):
+        for idx, (name, desc, status_key, expected, filename, key) in enumerate(scenarios):
             target = col1 if idx % 2 == 0 else col2
             with target:
                 st.markdown(f"### {name}")
                 st.caption(desc)
-                st.caption(f"🎯 **Expected Outcome:** `{expected}`")
-                if st.button(f"▶ Run {name.split(':')[0]}", key=key, use_container_width=True):
+                st.html(f"<div>🎯 <strong>Expected Outcome:</strong> {badge_html(status_key, size='sm')} <code>{expected}</code></div>")
+                if st.button(f"▶ Run {name.split(':')[0]}", key=key, width="stretch"):
                     st.session_state["_pending_scenario"] = (filename, name)
                 st.markdown("---")
 
@@ -173,10 +219,12 @@ def _load_dataset_image_samples(limit: int = 3):
         buffer = io.BytesIO()
         image.thumbnail((900, 1200))
         image.save(buffer, format="JPEG", quality=88)
-        samples.append({
-            "id": f"sample-{row_index + 1}",
-            "image": buffer.getvalue(),
-        })
+        samples.append(
+            {
+                "id": f"sample-{row_index + 1}",
+                "image": buffer.getvalue(),
+            }
+        )
         if len(samples) >= limit:
             break
     return samples
@@ -193,9 +241,13 @@ def _render_dataset_check() -> None:
         "The Hugging Face `load_dataset` imagefolder view exposes image rows. Samples are "
         "synthetic and fetched only on request using streaming, not as a full dataset download."
     )
-    metric_a, metric_b = st.columns(2)
-    metric_a.metric("Dataset images", "8,181")
-    metric_b.metric("Loaded per check", "3")
+    render_kpis(
+        [
+            Kpi("Dataset images", "8,181", "Voxel51 invoice image corpus"),
+            Kpi("Loaded per check", "3", "Streamed on demand"),
+        ],
+        label="OCR dataset metrics",
+    )
     st.caption(
         "The dataset card describes OCR annotations, but the `load_dataset` imagefolder view "
         "returns image-only rows. This tab is a visual OCR smoke check; it does not calculate "
@@ -229,7 +281,7 @@ def _render_dataset_check() -> None:
     for index, (column, sample) in enumerate(zip(cols, samples), start=1):
         with column:
             st.markdown(f"**Sample {index}**")
-            st.image(sample["image"], use_container_width=True)
+            st.image(sample["image"], width="stretch")
             if st.button("Run OCR", key=f"dataset_ocr_{sample['id']}", disabled=not engine.is_available()):
                 try:
                     image = Image.open(io.BytesIO(sample["image"])).convert("RGB")
@@ -252,7 +304,6 @@ def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, f
     st.markdown(f"### ⚙️ Live Run — {title}")
     stage_placeholder = st.empty()
 
-    # Stage state and ordering (local copies so runs never mutate module globals).
     stages_order: list[str] = list(PIPELINE_STAGES)
     stage_state: dict[str, dict[str, Any]] = {
         name: {"status": "PENDING", "details": None, "duration_ms": None}
@@ -277,7 +328,6 @@ def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, f
         if not isinstance(name, str):
             return
         if name not in stage_state:
-            # Unknown label — append it so nothing is silently dropped.
             stage_state[name] = {"status": "PENDING", "details": None, "duration_ms": None}
             stages_order.append(name)
         if event["type"] == "start":
@@ -300,11 +350,16 @@ def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, f
             progress_callback=on_event,
         )
     except Exception as e:
-        st.error(f"Processing failed: {e}")
+        render_status_banner(
+            "FAILED",
+            title="Processing Run Failed — Needs Human Review",
+            body=str(e),
+        )
         return
 
     st.session_state["selected_invoice_id"] = inv_entity.id
     st.session_state["latest_run_id"] = run_entity.id
+    st.session_state["selected_run_id"] = run_entity.id
 
     _render_decision_card(inv_entity, run_entity)
 
@@ -312,24 +367,31 @@ def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, f
 def _render_decision_card(inv_entity, run_entity):
     """Renders the final reasoned decision with reasons and the recommended next action."""
     decision = getattr(run_entity, "decision_result", None)
-    status = inv_entity.final_decision
+    display_status = invoice_display_status(
+        inv_entity.final_decision, inv_entity.processing_status, inv_entity.manual_override_decision
+    )
+    meta = status_meta(display_status)
 
     st.markdown("### Decision")
-    palette = {
-        "APPROVED": ("green", "🟢"),
-        "NEEDS_REVIEW": ("orange", "🟠"),
-        "BLOCKED": ("red", "🔴"),
-    }
-    color, emoji = palette.get(status, ("blue", "🔵"))
+    summary_text = decision.summary if decision is not None else meta.description
+    render_status_banner(display_status, title=meta.label, body=summary_text)
 
-    st.markdown(f"## {emoji} :{color}[{status}]")
-    if decision is not None:
-        st.write(decision.summary)
-
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Decision", status)
-    col_b.metric("Extraction Confidence", f"{(inv_entity.extraction_confidence or 0)*100:.0f}%")
-    col_c.metric("Processing Time", f"{run_entity.duration_ms:.0f} ms" if run_entity.duration_ms else "—")
+    render_kpis(
+        [
+            Kpi("Decision", f"{meta.symbol} {meta.label}", f"Code: {display_status}", meta.tone),
+            Kpi(
+                "Invoice Total (INR)",
+                format_inr(convert_to_inr(inv_entity.total_amount, inv_entity.currency or "USD"))
+                if inv_entity.total_amount is not None
+                else "—",
+                format_native_and_inr(inv_entity.total_amount, inv_entity.currency),
+                "info",
+            ),
+            Kpi("Extraction Confidence", f"{(inv_entity.extraction_confidence or 0) * 100:.0f}%", "Weighted field confidence"),
+            Kpi("Processing Time", f"{run_entity.duration_ms:.0f} ms" if run_entity.duration_ms else "—", "19-stage execution"),
+        ],
+        label="Processed invoice decision metrics",
+    )
 
     if decision is not None:
         if decision.checks_failed:
@@ -349,3 +411,54 @@ def _render_decision_card(inv_entity, run_entity):
         f"Invoice #{inv_entity.id} processed. "
         "Open **Invoice Details** for the full audit workbench, or **Live Processing View** for the saved stage trace."
     )
+
+
+def _run_batch_upload(orchestrator: WorkflowOrchestrator, documents: list[tuple[str, bytes]]) -> None:
+    """Process multiple uploaded invoices with per-document error isolation."""
+    st.markdown(f"### 📦 Batch Run ({len(documents)} documents)")
+    progress = st.progress(0.0, text="Starting batch processing…")
+
+    def _on_item(idx: int, total: int, item) -> None:
+        progress.progress(idx / total, text=f"Processed {idx} of {total}: {item.filename} ({item.status})")
+
+    batch = run_invoice_batch(orchestrator, documents, on_item_complete=_on_item)
+    last_valid = next((r for r in reversed(batch.results) if r.invoice_id is not None), None)
+    if last_valid is not None:
+        st.session_state["selected_invoice_id"] = last_valid.invoice_id
+        st.session_state["latest_run_id"] = last_valid.run_id
+        st.session_state["selected_run_id"] = last_valid.run_id
+
+    render_kpis(
+        [
+            Kpi("Batch Total", str(batch.total), "Documents submitted", "info"),
+            Kpi("Approved", str(batch.approved), "Auto-approved", "success"),
+            Kpi("Needs Review", str(batch.needs_review), "Routed to reviewer", "warning"),
+            Kpi("Blocked", str(batch.blocked), "Hard control stops", "danger"),
+            Kpi("Failed", str(batch.failed), "Isolated errors", "danger" if batch.failed else "neutral"),
+        ],
+        label="Batch processing summary",
+    )
+
+    rows = []
+    for item in batch.results:
+        rows.append(
+            {
+                "ID": f"#{item.invoice_id}" if item.invoice_id else "—",
+                "Decision": item.status,
+                "Filename": item.filename,
+                "Invoice #": item.invoice_number or "—",
+                "Vendor": item.vendor_name or "Unmatched",
+                "Amount": format_native_and_inr(item.total_amount, item.currency),
+                "Confidence": f"{(item.confidence or 0) * 100:.0f}%" if item.confidence is not None else "—",
+                "Summary / Error": item.error or item.summary,
+            }
+        )
+    render_table(
+        rows,
+        ["ID", "Decision", "Filename", "Invoice #", "Vendor", "Amount", "Confidence", "Summary / Error"],
+        caption="Batch invoice processing outcomes",
+        column_kinds={"Decision": "status"},
+        wrap_columns=["Summary / Error", "Filename"],
+        numeric_columns=["ID", "Amount", "Confidence"],
+    )
+

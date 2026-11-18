@@ -9,6 +9,7 @@ from app.core.schemas import (
     LineItemMatch
 )
 from app.config.rules import rules_config
+from app.processing.currency import convert_amount
 from app.processing.duplicate_detector import DuplicateCheckResult
 from app.processing.financial_validator import FinancialValidator
 from app.utils.logging import get_logger
@@ -326,7 +327,9 @@ class RulesEngine:
         # 5. Financial Validation & PO Balance Rules
         # ======================================================================
         if financial_results is None:
-            financial_results = self.financial_validator.validate(normalized, matched_po)
+            financial_results = self.financial_validator.validate(
+                normalized, matched_po, allow_fx_conversion=True
+            )
         results.extend(financial_results)
 
         # Tax-rate reasonableness: tax should be a plausible fraction of subtotal.
@@ -386,16 +389,26 @@ class RulesEngine:
                     if 0 <= m.invoice_line_idx < len(normalized.line_items) else None
                 )
 
-                # Unit-price variance (invoice line vs PO line).
+                # Unit-price variance (invoice line vs PO line, converted to PO currency if needed).
                 if m.price_diff is not None and inv_item is not None:
-                    po_unit_price = round(inv_item.unit_price - m.price_diff, 2)
+                    inv_price_po_curr = (
+                        convert_amount(inv_item.unit_price, normalized.currency, matched_po.currency)
+                        if (
+                            matched_po
+                            and normalized.currency
+                            and matched_po.currency
+                            and normalized.currency != matched_po.currency
+                        )
+                        else inv_item.unit_price
+                    )
+                    po_unit_price = round(inv_price_po_curr - m.price_diff, 2)
                     if po_unit_price > 0:
                         var_pct = abs(m.price_diff) / po_unit_price
                         line_ref = m.po_line_number or (m.invoice_line_idx + 1)
                         if var_pct > price_review_pct:
                             price_review_lines.append(
-                                f"line {line_ref}: ${po_unit_price:.2f} PO vs "
-                                f"${inv_item.unit_price:.2f} invoiced ({var_pct*100:.1f}%)"
+                                f"line {line_ref}: {po_unit_price:.2f} PO vs "
+                                f"{inv_price_po_curr:.2f} invoiced ({var_pct*100:.1f}%)"
                             )
                         elif var_pct > price_note_pct:
                             results.append(
@@ -405,8 +418,8 @@ class RulesEngine:
                                     category="LINE_ITEM",
                                     result=RuleStatus.PASS,
                                     severity=RuleSeverity.INFO,
-                                    expected_value=f"${po_unit_price:.2f} (PO)",
-                                    actual_value=f"${inv_item.unit_price:.2f}",
+                                    expected_value=f"{po_unit_price:.2f} (PO)",
+                                    actual_value=f"{inv_price_po_curr:.2f}",
                                     difference=f"{var_pct*100:.1f}%",
                                     explanation=(
                                         f"Line {line_ref} unit price varies {var_pct*100:.1f}% from PO, "

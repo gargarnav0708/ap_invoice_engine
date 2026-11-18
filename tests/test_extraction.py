@@ -143,7 +143,16 @@ def test_live_provider_requests_strict_json_schema(monkeypatch):
     assert captured["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
     assert captured["max_completion_tokens"] == settings.LLM_MAX_COMPLETION_TOKENS
     assert captured["reasoning_effort"] == "low"
-    assert captured["include_reasoning"] is False
+    assert captured["extra_body"] == {"include_reasoning": False}
+    assert "include_reasoning" not in captured
+
+    # Verify all passed kwargs are accepted by the real OpenAI SDK Completions.create signature
+    import inspect
+    from openai.resources.chat.completions import Completions
+
+    sig = inspect.signature(Completions.create)
+    for kw in captured:
+        assert kw in sig.parameters, f"Unsupported keyword argument for Completions.create: {kw}"
 
 
 def test_live_provider_retries_completion_token_truncation_with_larger_budget(monkeypatch):

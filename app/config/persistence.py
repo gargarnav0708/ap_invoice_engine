@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.config.rules import EditableRuleThresholds, rules_config
 from app.config.settings import settings
 from app.database.entities import AppConfig
+from app.processing.currency import get_usd_to_inr_rate, set_usd_to_inr_rate
 from app.utils.logging import get_logger
 from app.utils.time import now_utc
 
@@ -15,6 +16,7 @@ logger = get_logger("config_persistence")
 
 RULE_THRESHOLDS_KEY = "rule_thresholds"
 EXTRACTION_PREFERENCES_KEY = "extraction_preferences"
+FX_USD_TO_INR_KEY = "fx_usd_to_inr_rate"
 ExtractionMode = Literal["demo", "live"]
 
 
@@ -88,6 +90,23 @@ class ConfigurationService:
             )
         self._upsert(EXTRACTION_PREFERENCES_KEY, preferences.model_dump_json())
         return preferences
+
+    def load_usd_to_inr_rate(self) -> float:
+        record = self.session.get(AppConfig, FX_USD_TO_INR_KEY)
+        if record is None:
+            return get_usd_to_inr_rate()
+        try:
+            rate = float(record.value)
+            if rate > 0:
+                return set_usd_to_inr_rate(rate)
+        except (TypeError, ValueError):
+            logger.error("Stored USD->INR FX rate is invalid; keeping default.", exc_info=True)
+        return get_usd_to_inr_rate()
+
+    def save_usd_to_inr_rate(self, rate: float) -> float:
+        validated = set_usd_to_inr_rate(rate)
+        self._upsert(FX_USD_TO_INR_KEY, f"{validated:.4f}")
+        return validated
 
     def _upsert(self, key: str, value: str) -> None:
         record = self.session.get(AppConfig, key)

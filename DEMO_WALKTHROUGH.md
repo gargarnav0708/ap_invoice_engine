@@ -3,13 +3,13 @@
 ## Before the demo
 
 - Use a fresh disposable database with the seeded vendors and POs.
-- Confirm the sidebar reports the extraction mode and `OCR: Tesseract ready`.
+- Confirm the sidebar reports the extraction mode, `OCR: Tesseract ready`, and the **Theme** selector (`☀️ Light` / `🌙 Dark`).
 - Do not upload real invoices; the review label is not authenticated, and the free Render setup is temporary.
 - For a near-duplicate demonstration, process Scenario 1 before Scenario 7.
 
 ## 0:00–0:40 — Frame the problem
 
-Open **Overview Dashboard**. Explain that the engine extracts invoice facts, matches vendors and POs, applies deterministic financial controls, and routes uncertain cases to human review. The LLM extracts fields only; the rules engine makes the decision.
+Open **Overview Dashboard** (toggle between `☀️ Light` and `🌙 Dark` in the sidebar if desired). Explain that the engine extracts invoice facts, matches vendors and POs, applies deterministic financial controls, and routes uncertain cases to human review. The LLM extracts fields only; the rules engine makes the decision.
 
 ## 0:40–1:35 — Show a clean approval
 
@@ -25,7 +25,7 @@ Run **Scenario 5: Low-Quality Scan**. Show that the raster invoice goes through 
 
 ## 3:15–4:35 — Resolve a review
 
-Run **Scenario 6: Ambiguous PO**. Open **Invoice Details**, inspect the extracted evidence and candidate match, select the correct PO if known, enter a reviewer label and a mandatory reason, then save the review. Show the before/after correction and reason in the audit trail.
+Run **Scenario 6: Ambiguous PO**. Open **Invoice Details**, use the **Document Preview** controls (`Page`, `Zoom`, `Rotate`, and `Highlight extracted fields`) to inspect the invoice alongside the extracted evidence and candidate match, select the correct PO if known, enter a reviewer label and a mandatory reason, then save the review. Show the before/after correction and reason in the audit trail, and optionally export the audited record as **Xero Bills CSV**, **QuickBooks CSV**, or **Audit JSON** (also available across pages in **Invoice History**).
 
 ## 4:35–5:00 — Close with controls and limits
 

@@ -17,7 +17,7 @@ CRITICAL EXTRACTION RULES:
 5. All amounts must be numbers (e.g. 1250.50, not "$1,250.50").
 6. Dates should be in ISO 8601 (YYYY-MM-DD) format if decipherable, or verbatim string if ambiguous.
 7. Extract invoice_date, due_date, and paid_date as separate concepts. A "Paid" or "Payment Date" label is not the due date.
-8. Extract currency only when the document states an ISO currency code or an unambiguous currency symbol. A bare "$" is ambiguous: return null and preserve "$" as evidence; do not assume USD.
+8. Extract the 3-letter ISO 4217 currency code (e.g., "INR" for ₹ / Rs. / Rupees / INR; "USD" for USD / US$ / $; "EUR" for €; "GBP" for £; or "CAD", "AUD", "NZD", "HKD", "SGD" when prefixed as CA$, A$, HK$, NZ$, S$).
 9. Return strictly valid JSON matching the required schema.
 """
 

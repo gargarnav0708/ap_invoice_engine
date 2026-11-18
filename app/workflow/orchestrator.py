@@ -27,6 +27,11 @@ from app.utils.hashing import calculate_file_hash
 from app.ingestion.pdf_loader import PDFLoader
 from app.extraction.extractor import InvoiceExtractor
 from app.extraction.confidence import compute_evidence_ocr_confidence
+from app.processing.currency import (
+    SUPPORTED_CURRENCIES,
+    convert_amount,
+    resolve_invoice_currency,
+)
 from app.processing.normalizer import normalize_invoice
 from app.processing.vendor_matcher import VendorMatcher
 from app.processing.po_matcher import POMatcher
@@ -248,6 +253,7 @@ class WorkflowOrchestrator:
             exec_logger.start_stage("11. Match purchase order")
             matched_po, po_cands, po_score, po_status = self.po_matcher.match_po(normalized, matched_vendor)
             po_num_matched = matched_po.po_number if matched_po else "None"
+            resolve_invoice_currency(extracted_data, normalized, matched_po, matched_vendor)
             exec_logger.complete_stage(f"PO match: '{po_num_matched}' (status={po_status}, score={po_score:.2f})")
 
             # Stage 12: Detect duplicate invoices (Level 2-4 with vendor context)
@@ -268,7 +274,9 @@ class WorkflowOrchestrator:
 
             # Stage 14: Run financial validation (arithmetic, subtotal, tax, currency)
             exec_logger.start_stage("14. Run financial validation")
-            financial_results = self.rules_engine.financial_validator.validate(normalized, matched_po)
+            financial_results = self.rules_engine.financial_validator.validate(
+                normalized, matched_po, allow_fx_conversion=True
+            )
             fin_fails = [r for r in financial_results
                          if r.category == "FINANCIAL" and r.result == RuleStatus.FAIL]
             fin_checks = [r for r in financial_results if r.category == "FINANCIAL"]
@@ -422,14 +430,20 @@ class WorkflowOrchestrator:
 
             # If the invoice is AUTOMATICALLY APPROVED, atomically update PO billed balance
             if decision.status == DecisionStatus.APPROVED and matched_po and normalized.total_amount:
+                po_reservation_amount = (
+                    convert_amount(normalized.total_amount, normalized.currency, matched_po.currency)
+                    if normalized.currency and matched_po.currency and normalized.currency != matched_po.currency
+                    else normalized.total_amount
+                )
                 success, err = self.po_repo.update_billed_balance_atomic(
                     po_id=matched_po.id,
-                    invoice_amount=normalized.total_amount,
+                    invoice_amount=po_reservation_amount,
                     action="ADD"
                 )
                 if success:
                     exec_logger.complete_stage(
-                        f"Updated PO {matched_po.po_number}: Billed +${normalized.total_amount:.2f}, Rem. Balance ${matched_po.remaining_balance:.2f}"
+                        f"Updated PO {matched_po.po_number}: Billed +{matched_po.currency} {po_reservation_amount:.2f}, "
+                        f"Rem. Balance {matched_po.currency} {matched_po.remaining_balance:.2f}"
                     )
                 else:
                     exec_logger.complete_stage(f"PO reservation failed safely: {err}")
@@ -610,7 +624,7 @@ class WorkflowOrchestrator:
                 target_invoice_number = str(corrected_fields["invoice_number"]).strip() or None
             if "currency" in corrected_fields:
                 currency_value = corrected_fields["currency"]
-                supported_currencies = {"USD", "HKD", "CAD", "AUD", "NZD", "EUR", "GBP", "INR", "JPY", "CNY"}
+                supported_currencies = set(SUPPORTED_CURRENCIES)
                 if currency_value is not None and currency_value not in supported_currencies:
                     raise APException("Corrected invoice currency must be a supported ISO currency code or unconfirmed.")
                 target_currency = currency_value
@@ -629,8 +643,8 @@ class WorkflowOrchestrator:
             corrected_po = self.po_repo.get_by_id(target_po_id)
             if corrected_po and corrected_po.vendor_id != target_vendor_id:
                 raise APException("The corrected purchase order must belong to the corrected vendor.")
-            if new_decision == DecisionStatus.APPROVED.value and corrected_po and target_currency != corrected_po.currency:
-                raise APException("An invoice cannot be approved when its currency is unconfirmed or differs from the linked PO.")
+            if new_decision == DecisionStatus.APPROVED.value and corrected_po and not target_currency:
+                raise APException("An invoice cannot be approved when its currency is unconfirmed.")
 
         invoice.vendor_id = target_vendor_id
         invoice.matched_po_id = target_po_id
@@ -662,15 +676,28 @@ class WorkflowOrchestrator:
             invoice.manual_override_noop = True
             return invoice
 
-        po_or_amount_changed = old_po_id != new_po_id or old_amount != new_amount
+        old_currency = before.get("currency")
+        old_po_obj = self.po_repo.get_by_id(old_po_id) if old_po_id else None
+        new_po_obj = self.po_repo.get_by_id(new_po_id) if new_po_id else None
+        old_po_amount = (
+            convert_amount(old_amount, old_currency, old_po_obj.currency)
+            if old_po_obj and old_currency and old_po_obj.currency and old_currency != old_po_obj.currency
+            else old_amount
+        )
+        new_po_amount = (
+            convert_amount(new_amount, invoice.currency, new_po_obj.currency)
+            if new_po_obj and invoice.currency and new_po_obj.currency and invoice.currency != new_po_obj.currency
+            else new_amount
+        )
+        po_or_amount_changed = old_po_id != new_po_id or old_po_amount != new_po_amount
         try:
             # Reverse the previously approved reservation before applying the
             # corrected one. Both operations share this DB transaction, so a
             # failed replacement rolls back the reversal too.
             if old_decision == DecisionStatus.APPROVED.value and (
                 new_decision != DecisionStatus.APPROVED.value or po_or_amount_changed
-            ) and old_po_id and old_amount > 0:
-                ok, error = self.po_repo.update_billed_balance_atomic(old_po_id, old_amount, action="REVERT")
+            ) and old_po_id and old_po_amount > 0:
+                ok, error = self.po_repo.update_billed_balance_atomic(old_po_id, old_po_amount, action="REVERT")
                 if not ok:
                     raise APException(f"Could not release the original PO reservation: {error}")
 
@@ -678,9 +705,9 @@ class WorkflowOrchestrator:
                 old_decision != DecisionStatus.APPROVED.value or po_or_amount_changed
             ):
                 if new_po_id:
-                    if new_amount <= 0:
+                    if new_po_amount <= 0:
                         raise APException("An approved PO invoice requires a positive total amount.")
-                    ok, error = self.po_repo.update_billed_balance_atomic(new_po_id, new_amount, action="ADD")
+                    ok, error = self.po_repo.update_billed_balance_atomic(new_po_id, new_po_amount, action="ADD")
                     if not ok:
                         raise APException(f"Could not reserve the corrected PO balance: {error}")
         except APException:
