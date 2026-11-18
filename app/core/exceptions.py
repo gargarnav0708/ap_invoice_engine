@@ -5,7 +5,9 @@ Distinguishes between business exceptions and technical failures.
 
 class APException(Exception):
     """Base exception for all AP Automation errors."""
-    def __init__(self, message: str, details: dict = None):
+    def __init__(
+        self, message: str, details: dict[str, object] | None = None
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.details = details or {}

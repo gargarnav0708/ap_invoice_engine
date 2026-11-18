@@ -1,7 +1,4 @@
-"""
-Modular LLM extraction provider interface and implementations.
-Supports live OpenAI-compatible LLMs and an explicit deterministic synthetic/mock provider.
-"""
+"""Modular Groq and deterministic invoice extraction providers."""
 from abc import ABC, abstractmethod
 import json
 import re
@@ -21,6 +18,48 @@ from app.utils.logging import get_logger
 logger = get_logger("llm_provider")
 
 
+def _is_completion_truncation(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "max_completion_tokens",
+        "max completion tokens",
+        "output was truncated",
+        "truncated to fit",
+        "missing required content",
+        "reached before generating a valid document",
+        "finish_reason=length",
+    ))
+
+
+def _parse_amount_token(value: str) -> Optional[float]:
+    """Parse common OCR punctuation variants without multiplying amounts by 1000."""
+    token = re.sub(r"[^\d.,-]", "", value.strip())
+    if not token or not re.search(r"\d", token):
+        return None
+
+    if "," in token and "." in token:
+        decimal_separator = "." if token.rfind(".") > token.rfind(",") else ","
+        grouping_separator = "," if decimal_separator == "." else "."
+        token = token.replace(grouping_separator, "").replace(decimal_separator, ".")
+    elif token.count(",") > 1:
+        parts = token.split(",")
+        if len(parts[-1]) == 2 and all(len(part) == 3 for part in parts[1:-1]):
+            token = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            token = "".join(parts)
+    elif "," in token:
+        left, right = token.rsplit(",", 1)
+        token = left + ("." + right if len(right) == 2 else right)
+    elif "." in token:
+        left, right = token.rsplit(".", 1)
+        if len(right) == 3 and left.replace("-", "").isdigit():
+            token = left + right
+    try:
+        return round(float(token), 2)
+    except ValueError:
+        return None
+
+
 class BaseLLMProvider(ABC):
     """Abstract interface for LLM extraction providers."""
 
@@ -36,8 +75,8 @@ class BaseLLMProvider(ABC):
         pass
 
 
-class OpenAICompatibleProvider(BaseLLMProvider):
-    """Live LLM provider using OpenAI-compatible API."""
+class GroqProvider(BaseLLMProvider):
+    """Live Groq provider using its OpenAI-compatible chat completions API."""
 
     def __init__(self, api_key: str, base_url: str, model: str):
         from openai import OpenAI
@@ -46,30 +85,86 @@ class OpenAICompatibleProvider(BaseLLMProvider):
 
     @property
     def provider_name(self) -> str:
-        return f"OpenAI-Compatible ({self.model})"
+        return f"Groq ({self.model})"
 
     def extract_invoice(self, document_text: str) -> ExtractedInvoice:
         try:
-            logger.info(f"Calling live LLM ({self.model}) for invoice extraction...")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_EXTRACTION_PROMPT},
-                    {"role": "user", "content": build_user_prompt(document_text)}
-                ],
-                response_format={
+            logger.info(f"Calling Groq ({self.model}) for invoice extraction...")
+            messages = [
+                {"role": "system", "content": SYSTEM_EXTRACTION_PROMPT},
+                {"role": "user", "content": build_user_prompt(document_text)}
+            ]
+            completion = self.client.chat.completions
+            initial_budget = max(256, min(int(settings.LLM_MAX_COMPLETION_TOKENS), 65536))
+            configured_retry = int(settings.LLM_RETRY_MAX_COMPLETION_TOKENS)
+            retry_budget = min(65536, max(configured_retry, initial_budget * 2))
+
+            def request(response_format: dict, budget: int):
+                parameters = {
+                    "model": self.model,
+                    "messages": messages,
+                    "response_format": response_format,
+                    "temperature": 0.0,
+                    "max_completion_tokens": budget,
+                    "timeout": 45.0,
+                }
+                # Groq documents reasoning_effort for GPT-OSS. Low effort keeps
+                # extraction deterministic while reserving completion budget for JSON.
+                if self.model.startswith("openai/gpt-oss-"):
+                    effort = settings.LLM_REASONING_EFFORT
+                    parameters["reasoning_effort"] = effort if effort in {"low", "medium", "high"} else "low"
+                    parameters["include_reasoning"] = False
+                try:
+                    return completion.create(**parameters)
+                except Exception as error:
+                    if (
+                        _is_completion_truncation(error)
+                        or getattr(error, "status_code", None) != 400
+                        or "failed to validate json" not in str(error).lower()
+                        or response_format.get("type") != "json_schema"
+                    ):
+                        raise
+                    logger.warning("Groq rejected schema-constrained output; retrying with JSON mode.")
+                    parameters["response_format"] = {"type": "json_object"}
+                    return completion.create(**parameters)
+
+            try:
+                response = request({
                     "type": "json_schema",
                     "json_schema": {
                         "name": "invoice_extraction",
                         "strict": True,
                         "schema": build_strict_extraction_schema(),
                     },
-                },
-                temperature=0.0,
-                timeout=45.0
-            )
+                }, initial_budget)
+                first_choice = response.choices[0] if response.choices else None
+                if getattr(first_choice, "finish_reason", None) == "length":
+                    raise RuntimeError("Groq completion finish_reason=length; structured output was truncated.")
+            except Exception as error:
+                if not _is_completion_truncation(error) or retry_budget <= initial_budget:
+                    raise
+                logger.warning(
+                    "Groq truncated invoice extraction at %s completion tokens; retrying once with %s.",
+                    initial_budget,
+                    retry_budget,
+                )
+                response = request({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "invoice_extraction",
+                        "strict": True,
+                        "schema": build_strict_extraction_schema(),
+                    },
+                }, retry_budget)
+                retry_choice = response.choices[0] if response.choices else None
+                if getattr(retry_choice, "finish_reason", None) == "length":
+                    raise ExtractionError(
+                        f"Invoice extraction was still truncated after retrying with {retry_budget} completion tokens."
+                    )
 
             raw_content = response.choices[0].message.content
+            if not raw_content:
+                raise ExtractionError("Live LLM returned an empty response.")
             parsed_json = json.loads(raw_content)
 
             # Validate against Pydantic schema
@@ -105,6 +200,20 @@ class MockLLMProvider(BaseLLMProvider):
                 return val, 0.95, match.group(0)
             return None, 0.0, None
 
+        def evidence_page(evidence: Optional[str]) -> Optional[int]:
+            if not evidence:
+                return None
+            evidence_position = document_text.find(evidence)
+            if evidence_position < 0:
+                return None
+            markers = list(
+                re.finditer(
+                    r"--- Page (\d+) ---",
+                    document_text[: evidence_position + 1],
+                )
+            )
+            return int(markers[-1].group(1)) if markers else None
+
         # 1. Vendor Name
         vendor_val, vendor_conf, vendor_ev = None, 0.0, None
         vendor_match = re.search(r"Vendor:\s*([^\n\r]+)", document_text, re.IGNORECASE)
@@ -127,8 +236,10 @@ class MockLLMProvider(BaseLLMProvider):
         tax_val, tax_conf, tax_ev = find_regex(r"(?:Tax\s*ID|VAT|EIN|Registration):?\s*([A-Za-z0-9\-_]+)", document_text)
 
         # 4. Dates
-        date_val, date_conf, date_ev = find_regex(r"(?:Invoice\s*Date|Date):?\s*(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})", document_text)
-        due_val, due_conf, due_ev = find_regex(r"(?:Due\s*Date|Payment\s*Due):?\s*(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})", document_text)
+        date_pattern = r"(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s*\d{4})"
+        date_val, date_conf, date_ev = find_regex(rf"(?:Invoice\s*Date|Date):?\s*{date_pattern}", document_text)
+        due_val, due_conf, due_ev = find_regex(rf"(?:Due\s*Date|Payment\s*Due):?\s*{date_pattern}", document_text)
+        paid_val, paid_conf, paid_ev = find_regex(rf"(?:Paid|Payment\s*Date):?\s*\(?\s*{date_pattern}", document_text)
 
         # 5. PO Reference
         po_val, po_conf, po_ev = find_regex(r"(?:PO\s*(?:Reference|Ref|Number|#)?\s*:\s*)([A-Za-z0-9\-_]+)", document_text)
@@ -136,45 +247,46 @@ class MockLLMProvider(BaseLLMProvider):
             po_val, po_conf, po_ev = find_regex(r"\b(PO-\d{4}-\d{3,4})\b", document_text, group=1)
 
         # 6. Currency
-        curr_val = "USD"
-        curr_conf = 0.95
-        curr_ev = "USD"
-        if "EUR" in document_text or "€" in document_text:
-            curr_val, curr_ev = "EUR", "EUR/€"
-        elif "GBP" in document_text or "£" in document_text:
-            curr_val, curr_ev = "GBP", "GBP/£"
+        curr_val, curr_conf, curr_ev = None, 0.0, None
+        currency_code = re.search(r"\b(USD|EUR|GBP|CAD|AUD|NZD|HKD|JPY|CNY|INR)\b", document_text, re.IGNORECASE)
+        unique_symbols = (("€", "EUR"), ("£", "GBP"), ("₹", "INR"), ("US$", "USD"),
+                          ("HK$", "HKD"), ("CA$", "CAD"), ("A$", "AUD"), ("NZ$", "NZD"))
+        if currency_code:
+            curr_val, curr_conf, curr_ev = currency_code.group(1).upper(), 0.95, currency_code.group(0)
+        else:
+            symbol_match = next(((symbol, code) for symbol, code in unique_symbols if symbol in document_text), None)
+            if symbol_match:
+                curr_ev, curr_val = symbol_match
+                curr_conf = 0.90
+            elif "$" in document_text:
+                # Bare dollar signs are ambiguous; do not silently assume USD.
+                curr_ev = "$"
 
         # 7. Financial Totals
         subtotal_val, subtotal_conf, subtotal_ev = None, 0.0, None
-        sub_match = re.search(r"Subtotal:?\s*[\n\r]*\s*[\$€£]?\s*([\d,]+\.?\d*)", document_text, re.IGNORECASE)
+        sub_match = re.search(r"Subtotal:?\s*[\n\r]*\s*[\$€£]?\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if sub_match:
-            try:
-                subtotal_val = float(sub_match.group(1).replace(",", ""))
+            subtotal_val = _parse_amount_token(sub_match.group(1))
+            if subtotal_val is not None:
                 subtotal_conf, subtotal_ev = 0.95, sub_match.group(0)
-            except ValueError:
-                pass
 
         tax_val_amt, tax_amt_conf, tax_amt_ev = None, 0.0, None
-        tax_match = re.search(r"Tax(?:\s*\(\d+%\))?:?\s*[\n\r]*\s*[\$€£]?\s*([\d,]+\.?\d*)", document_text, re.IGNORECASE)
+        tax_match = re.search(r"Tax(?:\s*\(\d+%\))?:?\s*[\n\r]*\s*[\$€£]?\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if tax_match:
-            try:
-                tax_val_amt = float(tax_match.group(1).replace(",", ""))
+            tax_val_amt = _parse_amount_token(tax_match.group(1))
+            if tax_val_amt is not None:
                 tax_amt_conf, tax_amt_ev = 0.95, tax_match.group(0)
-            except ValueError:
-                pass
 
         total_val, total_conf, total_ev = None, 0.0, None
         # Prioritize matching "Total Amount:"
-        total_match = re.search(r"Total\s*Amount:?\s*[\n\r]*\s*[\$€£]?\s*([\d,]+\.?\d*)", document_text, re.IGNORECASE)
+        total_match = re.search(r"Total\s*Amount:?\s*[\n\r]*\s*[\$€£]?\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if not total_match:
             # Fall back to "Total:" but avoid single word column header "Total"
-            total_match = re.search(r"(?:Final\s*Total|Total\s*Due|Total):?\s*[\$€£]\s*([\d,]+\.?\d*)", document_text, re.IGNORECASE)
+            total_match = re.search(r"(?:Final\s*Total|Total\s*Due|Total):?\s*[\$€£]\s*([\d][\d.,]*)", document_text, re.IGNORECASE)
         if total_match:
-            try:
-                total_val = float(total_match.group(1).replace(",", ""))
+            total_val = _parse_amount_token(total_match.group(1))
+            if total_val is not None:
                 total_conf, total_ev = 0.95, total_match.group(0)
-            except ValueError:
-                pass
 
         # 8. Line Items (from extracted table or pipe format)
         extracted_line_items = []
@@ -192,27 +304,28 @@ class MockLLMProvider(BaseLLMProvider):
                 ltotal = float(table_match.group(4).replace(",", ""))
                 extracted_line_items.append(
                     ExtractedLineItem(
-                        description=ExtractedField(value=desc, confidence=0.95, evidence=line, extraction_method="synthetic"),
-                        quantity=ExtractedField(value=qty, confidence=0.95, evidence=line, extraction_method="synthetic"),
-                        unit=ExtractedField(value="EA", confidence=0.90, evidence=line, extraction_method="synthetic"),
-                        unit_price=ExtractedField(value=price, confidence=0.95, evidence=line, extraction_method="synthetic"),
-                        tax_amount=ExtractedField(value=0.0, confidence=0.80, evidence=line, extraction_method="synthetic"),
-                        line_total=ExtractedField(value=ltotal, confidence=0.95, evidence=line, extraction_method="synthetic"),
+                        description=ExtractedField(value=desc, confidence=0.95, evidence=line, page=evidence_page(line), extraction_method="synthetic"),
+                        quantity=ExtractedField(value=qty, confidence=0.95, evidence=line, page=evidence_page(line), extraction_method="synthetic"),
+                        unit=ExtractedField(value="EA", confidence=0.90, evidence=line, page=evidence_page(line), extraction_method="synthetic"),
+                        unit_price=ExtractedField(value=price, confidence=0.95, evidence=line, page=evidence_page(line), extraction_method="synthetic"),
+                        tax_amount=ExtractedField(value=0.0, confidence=0.80, evidence=line, page=evidence_page(line), extraction_method="synthetic"),
+                        line_total=ExtractedField(value=ltotal, confidence=0.95, evidence=line, page=evidence_page(line), extraction_method="synthetic"),
                     )
                 )
 
         invoice = ExtractedInvoice(
-            vendor_name=ExtractedField(value=vendor_val, confidence=vendor_conf, evidence=vendor_ev, extraction_method="synthetic"),
+            vendor_name=ExtractedField(value=vendor_val, confidence=vendor_conf, evidence=vendor_ev, page=evidence_page(vendor_ev), extraction_method="synthetic"),
             vendor_address=ExtractedField(value=None, confidence=0.0, extraction_method="synthetic"),
-            vendor_tax_id=ExtractedField(value=tax_val, confidence=tax_conf, evidence=tax_ev, extraction_method="synthetic"),
-            invoice_number=ExtractedField(value=inv_val, confidence=inv_conf, evidence=inv_ev, extraction_method="synthetic"),
-            invoice_date=ExtractedField(value=date_val, confidence=date_conf, evidence=date_ev, extraction_method="synthetic"),
-            due_date=ExtractedField(value=due_val, confidence=due_conf, evidence=due_ev, extraction_method="synthetic"),
-            po_reference=ExtractedField(value=po_val, confidence=po_conf, evidence=po_ev, extraction_method="synthetic"),
-            currency=ExtractedField(value=curr_val, confidence=curr_conf, evidence=curr_ev, extraction_method="synthetic"),
-            subtotal=ExtractedField(value=subtotal_val, confidence=subtotal_conf, evidence=subtotal_ev, extraction_method="synthetic"),
-            tax_amount=ExtractedField(value=tax_val_amt, confidence=tax_amt_conf, evidence=tax_amt_ev, extraction_method="synthetic"),
-            total_amount=ExtractedField(value=total_val, confidence=total_conf, evidence=total_ev, extraction_method="synthetic"),
+            vendor_tax_id=ExtractedField(value=tax_val, confidence=tax_conf, evidence=tax_ev, page=evidence_page(tax_ev), extraction_method="synthetic"),
+            invoice_number=ExtractedField(value=inv_val, confidence=inv_conf, evidence=inv_ev, page=evidence_page(inv_ev), extraction_method="synthetic"),
+            invoice_date=ExtractedField(value=date_val, confidence=date_conf, evidence=date_ev, page=evidence_page(date_ev), extraction_method="synthetic"),
+            due_date=ExtractedField(value=due_val, confidence=due_conf, evidence=due_ev, page=evidence_page(due_ev), extraction_method="synthetic"),
+            paid_date=ExtractedField(value=paid_val, confidence=paid_conf, evidence=paid_ev, page=evidence_page(paid_ev), extraction_method="synthetic"),
+            po_reference=ExtractedField(value=po_val, confidence=po_conf, evidence=po_ev, page=evidence_page(po_ev), extraction_method="synthetic"),
+            currency=ExtractedField(value=curr_val, confidence=curr_conf, evidence=curr_ev, page=evidence_page(curr_ev), extraction_method="synthetic"),
+            subtotal=ExtractedField(value=subtotal_val, confidence=subtotal_conf, evidence=subtotal_ev, page=evidence_page(subtotal_ev), extraction_method="synthetic"),
+            tax_amount=ExtractedField(value=tax_val_amt, confidence=tax_amt_conf, evidence=tax_amt_ev, page=evidence_page(tax_amt_ev), extraction_method="synthetic"),
+            total_amount=ExtractedField(value=total_val, confidence=total_conf, evidence=total_ev, page=evidence_page(total_ev), extraction_method="synthetic"),
             line_items=extracted_line_items,
             raw_text=document_text,
             is_mock=True
@@ -225,14 +338,20 @@ class MockLLMProvider(BaseLLMProvider):
 Tuple_Result = tuple[Optional[str], float, Optional[str]]
 
 
-def get_llm_provider() -> BaseLLMProvider:
-    """Factory to return appropriate LLM provider based on environment credentials."""
-    if settings.has_live_llm:
-        logger.info(f"Using live OpenAI-compatible LLM provider at {settings.LLM_BASE_URL}")
-        return OpenAICompatibleProvider(
+def get_llm_provider(mode: str | None = None) -> BaseLLMProvider:
+    """Return the explicitly selected provider, with a safe offline fallback."""
+    selected_mode = mode or settings.default_extraction_mode
+    if selected_mode == "live" and settings.has_live_llm:
+        logger.info(f"Using live Groq provider at {settings.LLM_BASE_URL}")
+        return GroqProvider(
             api_key=settings.LLM_API_KEY,
             base_url=settings.LLM_BASE_URL,
             model=settings.LLM_MODEL
         )
-    logger.info("No live LLM API key detected. Using Mock/Demo LLM Provider.")
+    if selected_mode == "live":
+        logger.warning(
+            "Live extraction requested without an LLM API key; using demo mode."
+        )
+    else:
+        logger.info("Using explicitly selected Demo / Offline extractor.")
     return MockLLMProvider()

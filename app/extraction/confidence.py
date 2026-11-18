@@ -1,9 +1,50 @@
 """
 Confidence scoring calculations for extracted invoice data.
 """
-from typing import List
+from typing import List, Optional, Dict, Any
+import re
 from app.core.schemas import ExtractedInvoice, ExtractedField
 from app.config.rules import rules_config
+
+
+def compute_evidence_ocr_confidence(evidence: Optional[str], words: List[Dict[str, Any]]) -> Optional[float]:
+    """Score the Tesseract word confidences supporting one extracted evidence snippet."""
+    if not evidence or not words:
+        return None
+
+    def tokens(value: str) -> List[str]:
+        return re.findall(r"[A-Za-z]+|\d[\d,./-]*|[$€£₹]", value)
+
+    def normalize(token: str) -> str:
+        if token in {"$", "€", "£", "₹"}:
+            return token
+        return re.sub(r"[^a-z0-9]", "", token.lower())
+
+    evidence_tokens = [normalize(token) for token in tokens(evidence)]
+    ocr_tokens = []
+    for word in words:
+        raw_text = str(word.get("text", ""))
+        try:
+            confidence = float(word.get("confidence"))
+        except (TypeError, ValueError):
+            continue
+        for token in tokens(raw_text):
+            ocr_tokens.append((normalize(token), raw_text, confidence))
+    if not evidence_tokens or not ocr_tokens:
+        return None
+
+    matched_confidences = []
+    for token in evidence_tokens:
+        match = next(
+            (confidence for candidate, raw, confidence in ocr_tokens
+             if token == candidate or (token in {"$", "€", "£", "₹"} and token in raw)),
+            None,
+        )
+        if match is not None:
+            matched_confidences.append(match)
+    coverage = len(matched_confidences) / len(evidence_tokens)
+    mean_confidence = sum(matched_confidences) / len(matched_confidences) if matched_confidences else 0.0
+    return round(mean_confidence * coverage, 1)
 
 
 def compute_overall_confidence(invoice: ExtractedInvoice) -> float:

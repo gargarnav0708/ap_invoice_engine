@@ -80,3 +80,31 @@ def test_currency_mismatch(test_db_session):
     curr_fails = [r for r in results if r.rule_id == "RULE_CURRENCY_MISMATCH" and r.result == RuleStatus.FAIL]
     assert len(curr_fails) == 1
     assert curr_fails[0].severity == RuleSeverity.HARD
+
+
+def test_total_that_conflicts_with_line_items_is_hard_failure():
+    invoice = NormalizedInvoice(
+        subtotal=8156400.0,
+        tax_amount=0.0,
+        total_amount=8156400.0,
+        currency=None,
+        line_items=[
+            NormalizedLineItem(description="Furniture", quantity=1, unit_price=232, line_total=232),
+            NormalizedLineItem(description="Services", quantity=2, unit_price=514, line_total=1028),
+            NormalizedLineItem(description="Repair", quantity=2, unit_price=152, line_total=304),
+        ],
+    )
+    results = FinancialValidator().validate(invoice)
+    line_sum_check = next(result for result in results if result.rule_id == "RULE_TOTAL_LINE_SUM_CHECK")
+    currency_check = next(result for result in results if result.rule_id == "RULE_CURRENCY_UNCONFIRMED")
+    assert line_sum_check.result == RuleStatus.FAIL
+    assert line_sum_check.severity == RuleSeverity.HARD
+    assert line_sum_check.expected_value == "1564.00"
+    assert currency_check.result == RuleStatus.WARN
+
+
+def test_unconfirmed_currency_is_never_treated_as_usd():
+    invoice = NormalizedInvoice(total_amount=100.0, currency=None)
+    results = FinancialValidator().validate(invoice)
+    warning = next(result for result in results if result.rule_id == "RULE_CURRENCY_UNCONFIRMED")
+    assert warning.result == RuleStatus.WARN

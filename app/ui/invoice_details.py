@@ -5,6 +5,7 @@ and human-in-the-loop overrides.
 """
 from pathlib import Path
 import json
+from typing import Any
 import streamlit as st
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -27,7 +28,13 @@ def render_invoice_details(session: Session):
 
     # Select invoice from dropdown
     default_id = st.session_state.get("selected_invoice_id", invoices[0].id)
-    inv_map = {inv.id: f"#{inv.id} - {inv.original_filename} ({inv.invoice_number or 'No Inv#'}) - ${inv.total_amount or 0.0:.2f}" for inv in invoices}
+    inv_map = {
+        inv.id: (
+            f"#{inv.id} - {inv.original_filename} ({inv.invoice_number or 'No Inv#'}) - "
+            f"{inv.currency + ' ' if inv.currency else 'Currency unconfirmed '}{inv.total_amount or 0.0:.2f}"
+        )
+        for inv in invoices
+    }
 
     selected_id = st.selectbox(
         "Select Invoice to Audit",
@@ -87,7 +94,7 @@ def render_invoice_details(session: Session):
 
         # Parse the persisted extraction payload for real per-field confidence
         # and the verbatim evidence snippet each value was taken from.
-        extracted = {}
+        extracted: dict[str, Any] = {}
         try:
             extracted = json.loads(invoice.extracted_data) if invoice.extracted_data else {}
         except Exception:
@@ -111,6 +118,7 @@ def render_invoice_details(session: Session):
             ("Invoice Number", "invoice_number", None),
             ("Invoice Date", "invoice_date", None),
             ("Payment Due Date", "due_date", None),
+            ("Paid Date", "paid_date", None),
             ("PO Reference", "po_reference", None),
             ("Currency", "currency", None),
             ("Tax ID", "vendor_tax_id", None),
@@ -122,18 +130,33 @@ def render_invoice_details(session: Session):
         fields_data = []
         for label, key, kind in field_specs:
             value, conf_str, ev = fld(key)
+            ocr_confidence = extracted.get("ocr_field_confidences", {}).get(key)
+            ocr_confidence_str = f"{ocr_confidence:.0f}%" if isinstance(ocr_confidence, (int, float)) else "—"
             if value is None:
-                shown = "— (not found)"
+                shown = "— (currency ambiguous)" if key == "currency" and ev != "—" else "— (not found)"
             elif kind == "money":
                 try:
-                    shown = f"${float(value):,.2f}"
+                    currency_field = extracted.get("currency")
+                    currency_value = currency_field.get("value") if isinstance(currency_field, dict) else None
+                    currency_code = currency_value if currency_value in {
+                        "USD", "EUR", "GBP", "CAD", "AUD", "NZD", "HKD", "JPY", "CNY", "INR"
+                    } else None
+                    shown = f"{currency_code + ' ' if currency_code else ''}{float(value):,.2f}"
+                    if not currency_code:
+                        shown += " (currency unconfirmed)"
                 except (TypeError, ValueError):
                     shown = str(value)
             else:
                 shown = str(value)
             ev_short = ev if len(str(ev)) <= 48 else str(ev)[:45] + "…"
             fields_data.append(
-                {"Field": label, "Value": shown, "Confidence": conf_str, "Evidence": ev_short}
+                {
+                    "Field": label,
+                    "Value": shown,
+                    "Confidence": conf_str,
+                    "OCR Conf.": ocr_confidence_str,
+                    "Evidence": ev_short,
+                }
             )
 
         fields_data.append(
@@ -149,6 +172,9 @@ def render_invoice_details(session: Session):
                 "Confidence": st.column_config.TextColumn(
                     "Conf.", help="Per-field extraction confidence (lower = more likely to need review)"
                 ),
+                "OCR Conf.": st.column_config.TextColumn(
+                    "OCR Conf.", help="Tesseract word confidence for the exact evidence snippet"
+                ),
                 "Evidence": st.column_config.TextColumn(
                     "Evidence", help="Verbatim snippet the value was extracted from"
                 ),
@@ -156,16 +182,22 @@ def render_invoice_details(session: Session):
         )
         if extracted.get("overall_confidence") is not None:
             st.caption(f"Overall extraction confidence: **{extracted['overall_confidence']*100:.0f}%**")
+        if extracted.get("ocr_confidence") is not None:
+            st.caption(f"OCR word confidence: **{extracted['ocr_confidence']:.1f}%**")
+        if extracted.get("raw_text"):
+            with st.expander("OCR / source text sent to the extractor"):
+                st.text(extracted["raw_text"])
 
     if invoice.manual_override_at:
         st.markdown("#### Reviewer-accepted values now in effect")
         final_vendor = invoice.vendor.legal_name if invoice.vendor else "Unmatched"
         final_po = invoice.matched_po.po_number if invoice.matched_po else "Unlinked"
-        value_cols = st.columns(4)
+        value_cols = st.columns(5)
         value_cols[0].metric("Vendor", final_vendor)
         value_cols[1].metric("Invoice #", invoice.invoice_number or "—")
         value_cols[2].metric("Purchase order", final_po)
-        value_cols[3].metric("Total", f"{invoice.currency or 'USD'} {invoice.total_amount:,.2f}" if invoice.total_amount is not None else "—")
+        value_cols[3].metric("Currency", invoice.currency or "Unconfirmed")
+        value_cols[4].metric("Total", f"{invoice.currency or 'Currency unconfirmed'} {invoice.total_amount:,.2f}" if invoice.total_amount is not None else "—")
 
     st.markdown("---")
 
@@ -189,9 +221,9 @@ def render_invoice_details(session: Session):
         if invoice.matched_po:
             p = invoice.matched_po
             st.success(f"**PO: {p.po_number}**")
-            st.write(f"- **Total PO Amount:** `${p.total_amount:.2f}`")
-            st.write(f"- **Previously Billed:** `${p.billed_amount:.2f}`")
-            st.write(f"- **Remaining Balance:** `${p.remaining_balance:.2f}`")
+            st.write(f"- **Total PO Amount:** `{p.currency} {p.total_amount:.2f}`")
+            st.write(f"- **Previously Billed:** `{p.currency} {p.billed_amount:.2f}`")
+            st.write(f"- **Remaining Balance:** `{p.currency} {p.remaining_balance:.2f}`")
             st.write(f"- **PO Status:** `{p.status}`")
         else:
             st.warning("No Purchase Order linked to this invoice.")
@@ -206,8 +238,8 @@ def render_invoice_details(session: Session):
                 "Line #": line.line_number,
                 "Description": line.description,
                 "Qty": line.quantity,
-                "Unit Price": f"${line.unit_price:.2f}",
-                "Line Total": f"${line.line_total:.2f}",
+                "Unit Price": f"{invoice.currency + ' ' if invoice.currency else ''}{line.unit_price:.2f}",
+                "Line Total": f"{invoice.currency + ' ' if invoice.currency else ''}{line.line_total:.2f}",
                 "Matched PO Line": po_match_desc,
             })
         st.dataframe(pd.DataFrame(items_rows), use_container_width=True)
@@ -224,17 +256,17 @@ def render_invoice_details(session: Session):
 
     if validations:
         v_rows = []
-        for v in validations:
-            res_icon = "✅ PASS" if v.result == "PASS" else ("❌ FAIL" if v.result == "FAIL" else "⚠️ WARN")
+        for validation in validations:
+            res_icon = "✅ PASS" if validation.result == "PASS" else ("❌ FAIL" if validation.result == "FAIL" else "⚠️ WARN")
             v_rows.append({
-                "Rule ID": v.rule_id,
-                "Rule Name": v.rule_name,
-                "Category": v.category,
+                "Rule ID": validation.rule_id,
+                "Rule Name": validation.rule_name,
+                "Category": validation.category,
                 "Result": res_icon,
-                "Severity": v.severity,
-                "Expected": v.expected_value or "-",
-                "Actual": v.actual_value or "-",
-                "Explanation": v.explanation
+                "Severity": validation.severity,
+                "Expected": validation.expected_value or "-",
+                "Actual": validation.actual_value or "-",
+                "Explanation": validation.explanation
             })
         st.dataframe(pd.DataFrame(v_rows), use_container_width=True)
     else:
@@ -288,8 +320,18 @@ def render_invoice_details(session: Session):
                 "Correct invoice number (leave unchanged to keep current)",
                 value=invoice.invoice_number or "",
             )
+            currency_choices = ["Keep current", "Unconfirmed", "USD", "HKD", "CAD", "AUD", "NZD", "EUR", "GBP", "INR", "JPY", "CNY"]
+            selected_currency = st.selectbox(
+                "Confirm/correct currency (use the PO or vendor record as evidence)",
+                options=currency_choices,
+                format_func=lambda value: (
+                    f"Keep current ({invoice.currency})" if value == "Keep current" and invoice.currency
+                    else "Keep current" if value == "Keep current"
+                    else value
+                ),
+            )
             corrected_total_amount = st.number_input(
-                f"Correct total amount ({invoice.currency or 'USD'})",
+                f"Correct total amount ({invoice.currency or 'currency unconfirmed'})",
                 min_value=0.0,
                 value=float(invoice.total_amount or 0.0),
                 step=0.01,
@@ -304,13 +346,15 @@ def render_invoice_details(session: Session):
             else:
                 try:
                     orchestrator = WorkflowOrchestrator(session)
-                    corrected_fields = {}
+                    corrected_fields: dict[str, object] = {}
                     if selected_vendor_id is not None:
                         corrected_fields["vendor_id"] = selected_vendor_id
                     if selected_po_id is not None:
                         corrected_fields["matched_po_id"] = selected_po_id
                     if (corrected_invoice_number.strip() or None) != invoice.invoice_number:
                         corrected_fields["invoice_number"] = corrected_invoice_number
+                    if selected_currency != "Keep current":
+                        corrected_fields["currency"] = None if selected_currency == "Unconfirmed" else selected_currency
                     current_total = round(float(invoice.total_amount), 2) if invoice.total_amount is not None else None
                     if round(float(corrected_total_amount), 2) != current_total:
                         corrected_fields["total_amount"] = corrected_total_amount

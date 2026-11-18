@@ -72,6 +72,7 @@ class ExtractedInvoice(BaseModel):
     invoice_number: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
     invoice_date: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
     due_date: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
+    paid_date: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
     po_reference: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
     currency: ExtractedField[str] = Field(default_factory=lambda: ExtractedField[str]())
     subtotal: ExtractedField[float] = Field(default_factory=lambda: ExtractedField[float]())
@@ -83,6 +84,9 @@ class ExtractedInvoice(BaseModel):
     raw_text: Optional[str] = None
     document_type: DocumentType = DocumentType.MACHINE_READABLE
     is_mock: bool = False
+    ocr_confidence: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    ocr_words: List[Dict[str, Any]] = Field(default_factory=list)
+    ocr_field_confidences: Dict[str, float] = Field(default_factory=dict)
     overall_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
@@ -108,6 +112,7 @@ class NormalizedInvoice(BaseModel):
     normalized_invoice_number: Optional[str] = None
     invoice_date: Optional[str] = None
     due_date: Optional[str] = None
+    paid_date: Optional[str] = None
     po_reference: Optional[str] = None
     normalized_po_reference: Optional[str] = None
     currency: Optional[str] = None

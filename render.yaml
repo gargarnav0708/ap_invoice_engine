@@ -23,6 +23,8 @@ services:
         value: "true"
       - key: ENABLE_DEMO_MODE
         value: "true"
+      - key: EXTRACTION_MODE
+        value: demo
       - key: PYTHONUNBUFFERED
         value: "1"
 

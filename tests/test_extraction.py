@@ -6,9 +6,16 @@ from types import SimpleNamespace
 from pydantic import ValidationError
 
 from app.core.schemas import ExtractedInvoice, ExtractedField, ExtractedLineItem
+from app.config.settings import settings
 from app.extraction.confidence import compute_overall_confidence
-from app.extraction.llm_provider import MockLLMProvider, OpenAICompatibleProvider
+from app.extraction.llm_provider import (
+    GroqProvider,
+    MockLLMProvider,
+    get_llm_provider,
+)
 from app.extraction.extraction_prompts import build_strict_extraction_schema
+from app.extraction.llm_provider import _parse_amount_token
+from app.processing.normalizer import normalize_currency, normalize_invoice
 
 
 @pytest.mark.parametrize("confidence", [-0.01, 1.01])
@@ -81,6 +88,19 @@ def test_mock_llm_provider_extraction():
     assert extracted.line_items[0].description.value == "Industrial Safety Helmets"
 
 
+def test_mock_extractor_retains_page_evidence_and_missing_values():
+    provider = MockLLMProvider()
+    extracted = provider.extract_invoice(
+        "--- Page 1 ---\nVendor: Acme Inc.\nInvoice Number: INV-PAGED\n"
+        "--- Page 2 ---\nTotal Amount: $25.00"
+    )
+
+    assert extracted.invoice_number.page == 1
+    assert extracted.total_amount.page == 2
+    assert extracted.po_reference.value is None
+    assert extracted.po_reference.page is None
+
+
 def test_strict_extraction_schema_marks_every_object_property_required():
     schema = build_strict_extraction_schema()
 
@@ -96,10 +116,11 @@ def test_strict_extraction_schema_marks_every_object_property_required():
     check(schema)
     assert schema["properties"]["vendor_name"]["properties"]["page"]["type"] == ["integer", "null"]
     assert schema["properties"]["line_items"]["items"]["properties"]["description"]["properties"]["page"]["type"] == ["integer", "null"]
+    assert "paid_date" in schema["properties"]
 
 
 def test_live_provider_requests_strict_json_schema(monkeypatch):
-    provider = OpenAICompatibleProvider(api_key="test-key", base_url="https://example.invalid/v1", model="test-model")
+    provider = GroqProvider(api_key="test-key", base_url="https://example.invalid/v1", model="openai/gpt-oss-20b")
     captured = {}
     payload = {
         "vendor_name": {"value": "Acme Inc", "confidence": 0.9, "evidence": "Acme Inc", "page": 1},
@@ -120,3 +141,130 @@ def test_live_provider_requests_strict_json_schema(monkeypatch):
     assert captured["response_format"]["type"] == "json_schema"
     assert captured["response_format"]["json_schema"]["strict"] is True
     assert captured["response_format"]["json_schema"]["schema"]["additionalProperties"] is False
+    assert captured["max_completion_tokens"] == settings.LLM_MAX_COMPLETION_TOKENS
+    assert captured["reasoning_effort"] == "low"
+    assert captured["include_reasoning"] is False
+
+
+def test_live_provider_retries_completion_token_truncation_with_larger_budget(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_MAX_COMPLETION_TOKENS", 1024)
+    monkeypatch.setattr(settings, "LLM_RETRY_MAX_COMPLETION_TOKENS", 2048)
+    provider = GroqProvider(api_key="test-key", base_url="https://example.invalid/v1", model="openai/gpt-oss-20b")
+    requests = []
+    payload = {"invoice_number": {"value": "INV-1", "confidence": 0.9}}
+
+    class TruncatedCompletionError(Exception):
+        status_code = 400
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            raise TruncatedCompletionError(
+                "max completion tokens reached before generating a valid document; output was truncated"
+            )
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content=__import__("json").dumps(payload)),
+        )])
+
+    provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = provider.extract_invoice("Invoice INV-1")
+
+    assert result.invoice_number.value == "INV-1"
+    assert [request["max_completion_tokens"] for request in requests] == [1024, 2048]
+
+
+def test_live_provider_retries_response_with_length_finish_reason(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_MAX_COMPLETION_TOKENS", 1024)
+    monkeypatch.setattr(settings, "LLM_RETRY_MAX_COMPLETION_TOKENS", 2048)
+    provider = GroqProvider(api_key="test-key", base_url="https://example.invalid/v1", model="test-model")
+    requests = []
+    payload = {"invoice_number": {"value": "INV-2", "confidence": 0.9}}
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        content = "{\"invoice_number\":" if len(requests) == 1 else __import__("json").dumps(payload)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="length" if len(requests) == 1 else "stop",
+            message=SimpleNamespace(content=content),
+        )])
+
+    provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = provider.extract_invoice("Invoice INV-2")
+
+    assert result.invoice_number.value == "INV-2"
+    assert [request["max_completion_tokens"] for request in requests] == [1024, 2048]
+
+
+def test_mock_extractor_keeps_paid_date_distinct_and_does_not_guess_bare_dollar_currency():
+    extracted = MockLLMProvider().extract_invoice(
+        "Invoice Date Jun 22, 2021\nDue Date Jun 27,2021\nPaid (Jun 22, 2021)\nTotal $1,564.00"
+    )
+    normalized = normalize_invoice(extracted)
+    assert normalized.invoice_date == "2021-06-22"
+    assert normalized.due_date == "2021-06-27"
+    assert normalized.paid_date == "2021-06-22"
+    assert extracted.currency.value is None
+    assert extracted.currency.evidence == "$"
+    assert normalize_currency("$") is None
+    assert normalize_currency("HK$") == "HKD"
+    assert normalize_currency("USD") == "USD"
+
+
+def test_amount_parser_repairs_common_ocr_decimal_separator_error():
+    assert _parse_amount_token("1,564,00") == 1564.0
+    assert _parse_amount_token("1.564,00") == 1564.0
+    assert _parse_amount_token("1,564.00") == 1564.0
+
+
+def test_live_provider_retries_groq_json_validation_error():
+    provider = GroqProvider(
+        api_key="test-key",
+        base_url="https://example.invalid/v1",
+        model="test-model",
+    )
+    request_formats = []
+    payload = {
+        "invoice_number": {"value": "INV-1", "confidence": 0.9},
+        "total_amount": {"value": 100.0, "confidence": 0.9},
+    }
+
+    class JSONValidationError(Exception):
+        status_code = 400
+
+    def create(**kwargs):
+        request_formats.append(kwargs["response_format"]["type"])
+        if len(request_formats) == 1:
+            raise JSONValidationError("Failed to validate JSON")
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=__import__("json").dumps(payload)
+                    )
+                )
+            ]
+        )
+
+    provider.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = provider.extract_invoice("Invoice INV-1, total $100.00")
+
+    assert request_formats == ["json_schema", "json_object"]
+    assert result.invoice_number.value == "INV-1"
+    assert result.total_amount.value == 100.0
+
+
+def test_live_provider_uses_configured_groq_endpoint(monkeypatch):
+    endpoint = "https://api.groq.com/openai/v1"
+    monkeypatch.setattr(settings, "LLM_API_KEY", "test-groq-key")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", endpoint)
+    monkeypatch.setattr(settings, "LLM_MODEL", "openai/gpt-oss-20b")
+
+    provider = get_llm_provider(mode="live")
+
+    assert isinstance(provider, GroqProvider)
+    assert str(provider.client.base_url).startswith(endpoint)
+    assert provider.model == "openai/gpt-oss-20b"

@@ -2,7 +2,7 @@
 Pytest configuration and shared test fixtures.
 """
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database.entities import Base, Vendor, PurchaseOrder, POLineItem
@@ -13,6 +13,14 @@ from app.processing.normalizer import normalize_vendor_name
 def test_db_session():
     """In-memory SQLite database session isolated per test function."""
     engine = create_engine("sqlite:///:memory:", echo=False)
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(dbapi_connection, connection_record):
+        del connection_record
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = TestingSessionLocal()

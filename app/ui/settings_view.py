@@ -2,10 +2,13 @@
 Streamlit Settings View: Inspection of business thresholds, AI providers, and system operations.
 """
 import streamlit as st
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.config.settings import settings
-from app.config.rules import rules_config
+from app.config.rules import EditableRuleThresholds
+from app.config.persistence import ConfigurationService
+from app.database.maintenance import reset_transactional_data
 from app.ingestion.ocr_engine import get_ocr_engine
 from app.database.entities import Vendor, PurchaseOrder, Invoice
 from scripts.seed_database import seed
@@ -14,27 +17,38 @@ from scripts.seed_database import seed
 def render_settings(session: Session):
     st.markdown("## ⚙️ AP Policy Configuration & Engine Settings")
     st.caption("Inspect and manage business thresholds, tolerances, and extraction providers.")
+    config_service = ConfigurationService(session)
+    thresholds = config_service.load_rule_thresholds()
+    extraction_preferences = config_service.load_extraction_preferences()
 
-    # 1. AI Provider Status
-    st.subheader("AI Extraction Provider Status")
+    # 1. AI Provider Status and runtime choice
+    st.subheader("Extraction Mode")
     col1, col2 = st.columns(2)
     with col1:
-        if settings.has_live_llm:
-            st.success("🟢 **Live LLM Provider Active**")
-            st.write(f"- **Base URL:** `{settings.LLM_BASE_URL}`")
-            st.write(f"- **Model:** `{settings.LLM_MODEL}`")
-        else:
-            st.warning("🟡 **Offline / Demo Mode Active**")
+        mode_options = ["demo", "live"] if settings.has_live_llm else ["demo"]
+        selected_mode = st.radio(
+            "Runtime extraction provider",
+            options=mode_options,
+            index=mode_options.index(extraction_preferences.mode),
+            format_func=lambda mode: (
+                "Demo / Offline (deterministic)" if mode == "demo" else "Live LLM"
+            ),
+            help="This selection stores only the mode. Credentials remain in environment configuration.",
+        )
+        if not settings.has_live_llm:
             st.caption(
-                "No `LLM_API_KEY` is configured for this runtime. Add it to `.env` locally "
-                "or to the service environment variables on Render. Running deterministic extraction."
+                "Live mode is unavailable because `LLM_API_KEY` is not configured. "
+                "Set it in `.env` locally or in Render environment variables; never enter it here."
             )
     with col2:
+        if extraction_preferences.mode == "live":
+            st.success(f"🟢 **Live LLM selected:** `{settings.LLM_MODEL}`")
+        else:
+            st.info("🟡 **Demo / Offline extraction selected**")
         ocr_engine = get_ocr_engine()
         ocr_status = "Tesseract ready" if ocr_engine.is_available() else "Unavailable"
         st.write(f"- **OCR Runtime:** `{ocr_status}`")
         st.write(f"- **Environment:** `{settings.APP_ENV}`")
-        st.write(f"- **Database URL:** `{settings.DATABASE_URL}`")
 
     st.markdown("---")
 
@@ -46,7 +60,7 @@ def render_settings(session: Session):
         with col_t1:
             arith_tol = st.number_input(
                 "Arithmetic & Rounding Tolerance ($)",
-                value=float(rules_config.financial.ARITHMETIC_TOLERANCE_ABS),
+                value=thresholds.arithmetic_tolerance_abs,
                 min_value=0.00,
                 max_value=1.00,
                 step=0.01,
@@ -54,7 +68,7 @@ def render_settings(session: Session):
             )
             near_dup_days = st.number_input(
                 "Near-Duplicate Date Window (Days)",
-                value=int(rules_config.duplicates.NEAR_DUPLICATE_DAYS_WINDOW),
+                value=thresholds.near_duplicate_days_window,
                 min_value=1,
                 max_value=60,
                 step=1,
@@ -66,7 +80,7 @@ def render_settings(session: Session):
                 "Vendor Fuzzy Match Threshold",
                 min_value=0.50,
                 max_value=1.00,
-                value=float(rules_config.matching.VENDOR_HIGH_CONFIDENCE_THRESHOLD),
+                value=thresholds.vendor_high_confidence_threshold,
                 step=0.01,
                 help="Minimum similarity score required to confidently auto-match a vendor name."
             )
@@ -74,18 +88,27 @@ def render_settings(session: Session):
                 "Minimum Extraction Confidence Threshold",
                 min_value=0.50,
                 max_value=1.00,
-                value=float(rules_config.extraction.MIN_OVERALL_CONFIDENCE_THRESHOLD),
+                value=thresholds.min_overall_confidence_threshold,
                 step=0.01,
                 help="Invoices with overall extraction confidence below this score are sent for human review."
             )
 
-        save_settings = st.form_submit_button("💾 Save Threshold Parameters", type="primary")
+        save_settings = st.form_submit_button("💾 Save Settings", type="primary")
         if save_settings:
-            rules_config.financial.ARITHMETIC_TOLERANCE_ABS = arith_tol
-            rules_config.duplicates.NEAR_DUPLICATE_DAYS_WINDOW = near_dup_days
-            rules_config.matching.VENDOR_HIGH_CONFIDENCE_THRESHOLD = vendor_thresh
-            rules_config.extraction.MIN_OVERALL_CONFIDENCE_THRESHOLD = min_conf
-            st.success("Thresholds and business parameters updated successfully for the current session.")
+            try:
+                validated = EditableRuleThresholds(
+                    arithmetic_tolerance_abs=arith_tol,
+                    near_duplicate_days_window=near_dup_days,
+                    vendor_high_confidence_threshold=vendor_thresh,
+                    min_overall_confidence_threshold=min_conf,
+                )
+                config_service.save_rule_thresholds(validated)
+                config_service.save_extraction_preferences(selected_mode)
+                session.commit()
+                st.success("Settings saved. They will survive application restarts.")
+            except (ValidationError, ValueError) as exc:
+                session.rollback()
+                st.error(f"Settings were not saved: {exc}")
 
     st.markdown("---")
 
@@ -98,17 +121,19 @@ def render_settings(session: Session):
         st.write(f"- Total Invoices: **{session.query(Invoice).count()}**")
 
     with col_d2:
-        if st.button("🔄 Reset & Reseed Database", type="secondary"):
-            # Clear existing invoices and dependent tables in proper order
-            from app.database.entities import InvoiceLineItem, ValidationResultEntity, AuditLog, ProcessingRun, POLineItem
-            session.query(InvoiceLineItem).delete()
-            session.query(ValidationResultEntity).delete()
-            session.query(AuditLog).delete()
-            session.query(ProcessingRun).delete()
-            session.query(Invoice).delete()
-            session.query(POLineItem).delete()
-            session.query(PurchaseOrder).delete()
-            session.query(Vendor).delete()
+        reset_allowed = settings.APP_ENV.strip().lower() in {"development", "test"}
+        confirm_reset = st.checkbox(
+            "I understand this deletes local demo transaction data",
+            disabled=not reset_allowed,
+        )
+        if not reset_allowed:
+            st.info("Reset is disabled in deployed and production environments.")
+        if st.button(
+            "🔄 Reset & Reseed Database",
+            type="secondary",
+            disabled=not (reset_allowed and confirm_reset),
+        ):
+            reset_transactional_data(session)
             session.commit()
             seed()
             st.success("Database reseeded successfully with clean sample procurement data.")

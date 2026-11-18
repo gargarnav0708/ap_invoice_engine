@@ -3,7 +3,7 @@ Business rules configuration and thresholds for AP Automation.
 All thresholds, tolerances, and rule parameters live here.
 """
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 @dataclass
@@ -60,6 +60,7 @@ class ExtractionConfig:
     # Confidence threshold to flag for human review
     MIN_OVERALL_CONFIDENCE_THRESHOLD: float = 0.75
     MIN_CRITICAL_FIELD_CONFIDENCE_THRESHOLD: float = 0.70
+    MIN_OCR_CONFIDENCE_THRESHOLD: float = 55.0
 
     # Critical fields required for automated processing
     CRITICAL_FIELDS: tuple = (
@@ -104,6 +105,42 @@ class AppRulesConfig:
     duplicates: DuplicateDetectionConfig = field(default_factory=DuplicateDetectionConfig)
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
     policy: DecisionPolicyConfig = field(default_factory=DecisionPolicyConfig)
+
+
+class EditableRuleThresholds(BaseModel):
+    """Validated subset of policy thresholds exposed in the Settings UI."""
+
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
+    arithmetic_tolerance_abs: float = Field(default=0.05, ge=0.0, le=1.0)
+    near_duplicate_days_window: int = Field(default=7, ge=1, le=60)
+    vendor_high_confidence_threshold: float = Field(default=0.88, ge=0.60, le=1.0)
+    min_overall_confidence_threshold: float = Field(default=0.75, ge=0.50, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_vendor_threshold(self) -> "EditableRuleThresholds":
+        if self.vendor_high_confidence_threshold < MatchingConfig.VENDOR_REVIEW_THRESHOLD:
+            raise ValueError(
+                "Vendor high-confidence threshold cannot be below the review threshold."
+            )
+        return self
+
+    @classmethod
+    def from_rules(cls, rules: AppRulesConfig) -> "EditableRuleThresholds":
+        return cls(
+            arithmetic_tolerance_abs=rules.financial.ARITHMETIC_TOLERANCE_ABS,
+            near_duplicate_days_window=rules.duplicates.NEAR_DUPLICATE_DAYS_WINDOW,
+            vendor_high_confidence_threshold=rules.matching.VENDOR_HIGH_CONFIDENCE_THRESHOLD,
+            min_overall_confidence_threshold=rules.extraction.MIN_OVERALL_CONFIDENCE_THRESHOLD,
+        )
+
+    def apply_to(self, rules: AppRulesConfig) -> None:
+        rules.financial.ARITHMETIC_TOLERANCE_ABS = self.arithmetic_tolerance_abs
+        rules.duplicates.NEAR_DUPLICATE_DAYS_WINDOW = self.near_duplicate_days_window
+        rules.matching.VENDOR_HIGH_CONFIDENCE_THRESHOLD = self.vendor_high_confidence_threshold
+        rules.extraction.MIN_OVERALL_CONFIDENCE_THRESHOLD = (
+            self.min_overall_confidence_threshold
+        )
 
 
 # Global default configuration instance

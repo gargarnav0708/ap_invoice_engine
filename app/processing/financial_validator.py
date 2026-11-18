@@ -22,6 +22,23 @@ class FinancialValidator:
         results: List[RuleResult] = []
         tol_abs = rules_config.financial.ARITHMETIC_TOLERANCE_ABS
 
+        if invoice.currency is None:
+            results.append(
+                RuleResult(
+                    rule_id="RULE_CURRENCY_UNCONFIRMED",
+                    rule_name="Invoice Currency Confirmation",
+                    category="FINANCIAL",
+                    result=RuleStatus.WARN,
+                    severity=RuleSeverity.SOFT,
+                    expected_value="An explicit, unambiguous currency code",
+                    actual_value="Unknown or ambiguous currency",
+                    explanation=(
+                        "The invoice does not identify a unique currency code. A bare '$' is ambiguous; "
+                        "confirm the currency against the purchase order or vendor record before approval."
+                    ),
+                )
+            )
+
         # 1. Line items arithmetic: quantity * unit_price == line_total
         if invoice.line_items:
             for idx, item in enumerate(invoice.line_items):
@@ -113,6 +130,38 @@ class FinancialValidator:
                         )
                     )
 
+            if invoice.line_items:
+                line_sum = round(sum(item.line_total for item in invoice.line_items), 2)
+                line_expected_total = round(line_sum + (invoice.tax_amount or 0.0), 2)
+                line_total_diff = abs(invoice.total_amount - line_expected_total)
+                if line_total_diff <= tol_abs:
+                    results.append(RuleResult(
+                        rule_id="RULE_TOTAL_LINE_SUM_CHECK",
+                        rule_name="Total Matches Line Items and Tax",
+                        category="FINANCIAL",
+                        result=RuleStatus.PASS,
+                        severity=RuleSeverity.INFO,
+                        expected_value=f"{line_expected_total:.2f}",
+                        actual_value=f"{invoice.total_amount:.2f}",
+                        difference=f"{line_total_diff:.2f}",
+                        explanation="Invoice total matches the sum of line items plus tax.",
+                    ))
+                else:
+                    results.append(RuleResult(
+                        rule_id="RULE_TOTAL_LINE_SUM_CHECK",
+                        rule_name="Total Matches Line Items and Tax",
+                        category="FINANCIAL",
+                        result=RuleStatus.FAIL,
+                        severity=RuleSeverity.HARD,
+                        expected_value=f"{line_expected_total:.2f}",
+                        actual_value=f"{invoice.total_amount:.2f}",
+                        difference=f"{line_total_diff:.2f}",
+                        explanation=(
+                            f"Declared total ({invoice.total_amount:.2f}) does not match line items "
+                            f"plus tax ({line_expected_total:.2f}). Review OCR and extracted amounts."
+                        ),
+                    ))
+
         # 4. PO Balance & Split Invoice Validation
         if po:
             # Currency check
@@ -129,7 +178,7 @@ class FinancialValidator:
                         explanation=f"Invoice currency ({invoice.currency}) does not match Purchase Order currency ({po.currency})."
                     )
                 )
-            else:
+            elif invoice.currency and po.currency:
                 results.append(
                     RuleResult(
                         rule_id="RULE_CURRENCY_MISMATCH",
@@ -137,8 +186,8 @@ class FinancialValidator:
                         category="FINANCIAL",
                         result=RuleStatus.PASS,
                         severity=RuleSeverity.INFO,
-                        expected_value=po.currency if po else "USD",
-                        actual_value=invoice.currency or "USD",
+                        expected_value=po.currency,
+                        actual_value=invoice.currency,
                         explanation="Invoice currency matches Purchase Order currency."
                     )
                 )

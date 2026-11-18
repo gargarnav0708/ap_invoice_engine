@@ -11,6 +11,9 @@ from app.ingestion.document_classifier import classify_document
 from app.ingestion.ocr_engine import FallbackOCREngine, get_ocr_engine
 from app.ingestion.pdf_loader import PDFLoader
 from app.config.settings import settings
+from app.extraction.llm_provider import MockLLMProvider
+from app.processing.normalizer import normalize_invoice
+from app.extraction.confidence import compute_evidence_ocr_confidence
 
 
 def test_classify_machine_readable_document():
@@ -59,3 +62,44 @@ def test_pdf_loader_ingestion():
     assert res.total_pages == 1
     assert res.document_type == DocumentType.MACHINE_READABLE
     assert "Acme Industrial Supplies" in res.full_text
+
+
+@pytest.mark.skipif(not get_ocr_engine().is_available(), reason="Tesseract is not installed")
+def test_low_resolution_invoice_is_preprocessed_and_key_fields_survive_ocr():
+    fixture = Path(__file__).parent / "fixtures" / "fuzzy_invoice_low_res.png"
+    result = PDFLoader().load_document(fixture, render_preview=False)
+
+    assert result.ocr_applied is True
+    assert result.ocr_confidence is not None and result.ocr_confidence >= 55.0
+    assert "Jun 22, 2021" in result.full_text
+    assert "Jun 27" in result.full_text
+    assert "1,564" in result.full_text
+
+    extracted = MockLLMProvider().extract_invoice(result.full_text)
+    normalized = normalize_invoice(extracted)
+    assert normalized.invoice_date == "2021-06-22"
+    assert normalized.due_date == "2021-06-27"
+    assert normalized.paid_date == "2021-06-22"
+    assert normalized.subtotal == 1564.0
+    assert normalized.total_amount == 1564.0
+    assert extracted.currency.value is None
+    assert extracted.currency.evidence == "$"
+    assert compute_evidence_ocr_confidence(extracted.invoice_date.evidence, result.ocr_words) >= 55.0
+    assert compute_evidence_ocr_confidence(extracted.due_date.evidence, result.ocr_words) >= 55.0
+    assert compute_evidence_ocr_confidence(extracted.total_amount.evidence, result.ocr_words) >= 55.0
+
+
+def test_pdf_loader_processes_every_page_and_preserves_table_evidence():
+    loader = PDFLoader()
+    loader.ocr_engine = FallbackOCREngine()
+    fixture = Path(__file__).parent / "fixtures" / "multi_page_invoice.pdf"
+
+    result = loader.load_pdf(fixture, render_preview=False)
+
+    assert result.total_pages == 3
+    assert [page.page_number for page in result.pages] == [1, 2, 3]
+    assert "INV-MULTI-001" in result.pages[0].text
+    assert "ITEM: Industrial Safety Helmets" in result.pages[1].table_text
+    assert "--- Page 2 ---" in result.full_text
+    assert result.pages[2].text == ""
+    assert result.ocr_unavailable is True

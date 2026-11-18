@@ -72,3 +72,77 @@ def test_workflow_human_override(test_db_session):
     assert audit_entry.previous_status == "NEEDS_REVIEW"
     assert audit_entry.new_status == "APPROVED"
     assert audit_entry.actor == "JANE_DOE_SENIOR_ANALYST"
+
+
+def test_manual_currency_confirmation_is_audited(test_db_session):
+    inv = Invoice(
+        original_filename="ambiguous-dollar.png",
+        file_hash="currency_review_hash",
+        file_path="/tmp/ambiguous-dollar.png",
+        total_amount=100.0,
+        currency=None,
+        final_decision="NEEDS_REVIEW",
+        processing_status="COMPLETED",
+    )
+    test_db_session.add(inv)
+    test_db_session.commit()
+
+    updated = WorkflowOrchestrator(test_db_session).apply_manual_override(
+        invoice_id=inv.id,
+        new_decision="NEEDS_REVIEW",
+        reason="Confirmed currency against vendor remittance instructions.",
+        actor="AP_REVIEWER",
+        corrected_fields={"currency": "HKD"},
+    )
+
+    assert updated.currency == "HKD"
+    audit = test_db_session.query(AuditLog).filter(
+        AuditLog.invoice_id == inv.id,
+        AuditLog.action == "MANUAL_OVERRIDE",
+    ).one()
+    import json
+    details = json.loads(audit.details)
+    assert details["changes"]["currency"] == {"before": None, "after": "HKD"}
+
+
+def test_paid_date_persists_on_invoice_record(test_db_session):
+    inv = Invoice(
+        original_filename="paid-date.png",
+        file_hash="paid_date_persistence_hash",
+        file_path="/tmp/paid-date.png",
+        invoice_number="INV-PAID-1",
+        paid_date="2021-06-22",
+        final_decision="NEEDS_REVIEW",
+    )
+    test_db_session.add(inv)
+    test_db_session.commit()
+
+    reloaded = test_db_session.query(Invoice).filter_by(id=inv.id).one()
+    assert reloaded.paid_date == "2021-06-22"
+
+
+def test_fuzzy_raster_invoice_end_to_end_extracts_dates_and_routes_ambiguity_to_review(
+    test_db_session, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "STORAGE_DIR", tmp_path / "uploads")
+    settings.STORAGE_DIR.mkdir(parents=True)
+    monkeypatch.setattr(settings, "LLM_API_KEY", "")
+    fixture = Path(__file__).parent / "fixtures" / "fuzzy_invoice_low_res.png"
+
+    invoice, run = WorkflowOrchestrator(test_db_session).process_invoice(
+        file_bytes=fixture.read_bytes(),
+        original_filename=fixture.name,
+    )
+
+    assert run.execution_status == "SUCCESS"
+    assert invoice.invoice_date == "2021-06-22"
+    assert invoice.due_date == "2021-06-27"
+    assert invoice.paid_date == "2021-06-22"
+    assert invoice.subtotal == 1564.0
+    assert invoice.total_amount == 1564.0
+    assert invoice.currency is None
+    assert invoice.final_decision == "NEEDS_REVIEW"
+    import json
+    extraction = json.loads(invoice.extracted_data)
+    assert extraction["ocr_confidence"] >= 55.0
+    assert extraction["ocr_field_confidences"]["total_amount"] >= 55.0

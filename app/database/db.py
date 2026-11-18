@@ -3,7 +3,7 @@ Database engine, session management, and initialization.
 """
 from contextlib import contextmanager
 from typing import Generator
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, Session
 from app.config.settings import settings
 from app.database.entities import Base
@@ -38,9 +38,21 @@ if is_sqlite:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+def ensure_paid_date_column(bind=engine) -> None:
+    """Add the paid-date column to existing installations without losing data."""
+    inspector = inspect(bind)
+    if not inspector.has_table("invoices"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("invoices")}
+    if "paid_date" not in columns:
+        with bind.begin() as connection:
+            connection.execute(text("ALTER TABLE invoices ADD COLUMN paid_date VARCHAR(50)"))
+
+
 def init_db() -> None:
     """Initialize all database tables."""
     Base.metadata.create_all(bind=engine)
+    ensure_paid_date_column(engine)
 
 
 @contextmanager

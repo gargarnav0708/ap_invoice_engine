@@ -5,7 +5,7 @@ from typing import List, Optional
 
 from app.database.entities import Vendor, PurchaseOrder
 from app.core.schemas import (
-    NormalizedInvoice, ExtractedInvoice, RuleResult, RuleStatus, RuleSeverity,
+    NormalizedInvoice, ExtractedInvoice, DocumentType, RuleResult, RuleStatus, RuleSeverity,
     LineItemMatch
 )
 from app.config.rules import rules_config
@@ -92,6 +92,60 @@ class RulesEngine:
                         f"Overall extraction confidence ({extracted.overall_confidence:.2f}) "
                         f"is below threshold ({rules_config.extraction.MIN_OVERALL_CONFIDENCE_THRESHOLD:.2f})."
                     )
+                )
+            )
+
+        low_ocr_fields = {
+            field_name: confidence
+            for field_name, confidence in extracted.ocr_field_confidences.items()
+            if confidence < rules_config.extraction.MIN_OCR_CONFIDENCE_THRESHOLD
+            and getattr(extracted, field_name, None) is not None
+            and getattr(extracted, field_name).value is not None
+        }
+        low_document_ocr = (
+            extracted.ocr_confidence is not None
+            and extracted.ocr_confidence < rules_config.extraction.MIN_OCR_CONFIDENCE_THRESHOLD
+        )
+        if low_document_ocr or low_ocr_fields:
+            field_summary = ", ".join(
+                f"{name} {confidence:.1f}%" for name, confidence in low_ocr_fields.items()
+            )
+            actual_confidence = (
+                f"{extracted.ocr_confidence:.1f}% document mean" if extracted.ocr_confidence is not None else "not available"
+            )
+            if field_summary:
+                actual_confidence += f"; low-evidence fields: {field_summary}"
+            results.append(
+                RuleResult(
+                    rule_id="RULE_LOW_OCR_CONFIDENCE",
+                    rule_name="OCR Word Confidence Threshold",
+                    category="EXTRACTION",
+                    result=RuleStatus.WARN,
+                    severity=RuleSeverity.SOFT,
+                    expected_value=f">= {rules_config.extraction.MIN_OCR_CONFIDENCE_THRESHOLD:.0f}%",
+                    actual_value=actual_confidence,
+                    explanation=(
+                        "OCR confidence for the document or one or more critical evidence snippets "
+                        f"is below the review threshold ({rules_config.extraction.MIN_OCR_CONFIDENCE_THRESHOLD:.0f}%). "
+                        "Verify dates, currency, and amounts against the source image."
+                    ),
+                )
+            )
+
+        if extracted.document_type in {DocumentType.SCANNED_IMAGE, DocumentType.HYBRID} and not extracted.line_items:
+            results.append(
+                RuleResult(
+                    rule_id="RULE_SCANNED_INVOICE_NO_LINE_ITEMS",
+                    rule_name="Scanned Invoice Line Item Coverage",
+                    category="EXTRACTION",
+                    result=RuleStatus.WARN,
+                    severity=RuleSeverity.SOFT,
+                    expected_value="Line items extracted or verified by a reviewer",
+                    actual_value="No line items extracted from scanned content",
+                    explanation=(
+                        "No line items were extracted from this scanned or hybrid invoice. "
+                        "Check the source image and totals before approval."
+                    ),
                 )
             )
 

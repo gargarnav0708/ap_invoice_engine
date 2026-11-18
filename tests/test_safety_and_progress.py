@@ -53,6 +53,7 @@ def test_corrected_approved_invoice_moves_po_reservation(test_db_session):
         vendor_id=old_po.vendor_id,
         matched_po_id=old_po.id,
         invoice_number="INV-TEST-1",
+        currency="USD",
         total_amount=1350.00,
         final_decision=DecisionStatus.APPROVED.value,
         processing_status="COMPLETED",

@@ -2,7 +2,6 @@
 Database repositories with atomic transactions and domain query methods.
 """
 from typing import List, Optional, Tuple
-from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, func, update
 
@@ -11,6 +10,7 @@ from app.database.entities import (
     InvoiceLineItem, ProcessingRun, ValidationResultEntity, AuditLog
 )
 from app.core.schemas import DecisionStatus, RuleStatus
+from app.utils.time import now_utc
 
 
 class VendorRepository:
@@ -119,7 +119,7 @@ class PORepository:
             )
 
         result = self.session.execute(stmt.execution_options(synchronize_session=False))
-        if result.rowcount != 1:
+        if getattr(result, "rowcount", 0) != 1:
             po_exists = self.session.query(PurchaseOrder.id).filter(PurchaseOrder.id == po_id).first()
             if not po_exists:
                 return False, f"Purchase Order ID {po_id} not found."
@@ -221,7 +221,7 @@ class AuditRepository:
             previous_status=previous_status,
             new_status=new_status,
             actor=actor,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=now_utc()
         )
         self.session.add(entry)
         self.session.flush()

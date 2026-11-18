@@ -49,7 +49,7 @@ def render_processing_view(session: Session):
             "NEEDS_REVIEW": "🟠 NEEDS REVIEW",
             "BLOCKED": "🔴 BLOCKED"
         }.get(
-            run.final_decision,
+            run.final_decision or "",
             "🔴 FAILED · NEEDS REVIEW" if run.execution_status == "FAILED"
             else run.final_decision or "IN PROGRESS",
         )

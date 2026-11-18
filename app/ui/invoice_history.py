@@ -62,8 +62,12 @@ def render_invoice_history(session: Session):
                 "Invoice #": inv.invoice_number or "N/A",
                 "Vendor": v_name,
                 "PO Ref": inv.po_reference or "N/A",
-                "Amount": f"${inv.total_amount:.2f}" if inv.total_amount is not None else "N/A",
-                "Currency": inv.currency or "USD",
+                "Amount": (
+                    f"{inv.currency + ' ' if inv.currency else ''}{inv.total_amount:.2f}"
+                    if inv.total_amount is not None else "N/A"
+                ),
+                "Currency": inv.currency or "Unconfirmed",
+                "Paid Date": inv.paid_date or "—",
                 "Decision": effective_status,
                 "Confidence": f"{inv.extraction_confidence*100:.0f}%",
                 "Processed Date": inv.created_at.strftime("%Y-%m-%d %H:%M")

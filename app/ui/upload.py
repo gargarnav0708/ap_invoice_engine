@@ -4,6 +4,7 @@ runners, with a true live run view (each of the 19 stages ticking over as it
 executes) and a final decision card showing the reasoned outcome.
 """
 import io
+from typing import Any
 
 import streamlit as st
 from sqlalchemy.orm import Session
@@ -252,9 +253,11 @@ def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, f
     stage_placeholder = st.empty()
 
     # Stage state and ordering (local copies so runs never mutate module globals).
-    stages_order = list(PIPELINE_STAGES)
-    stage_state = {name: {"status": "PENDING", "details": None, "duration_ms": None}
-                   for name in stages_order}
+    stages_order: list[str] = list(PIPELINE_STAGES)
+    stage_state: dict[str, dict[str, Any]] = {
+        name: {"status": "PENDING", "details": None, "duration_ms": None}
+        for name in stages_order
+    }
 
     def render():
         lines = []
@@ -269,8 +272,10 @@ def _run_with_live_view(orchestrator: WorkflowOrchestrator, file_bytes: bytes, f
                 lines.append(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {s['details']}")
         stage_placeholder.markdown("\n\n".join(lines))
 
-    def on_event(event: dict):
+    def on_event(event: dict[str, Any]) -> None:
         name = event.get("stage_name")
+        if not isinstance(name, str):
+            return
         if name not in stage_state:
             # Unknown label — append it so nothing is silently dropped.
             stage_state[name] = {"status": "PENDING", "details": None, "duration_ms": None}

@@ -4,12 +4,12 @@ Supports atomic transactions, idempotent reruns, and human overrides.
 """
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Callable
-from datetime import datetime, timezone
 import time
 import json
 from sqlalchemy.orm import Session
 
 from app.config.settings import settings
+from app.config.persistence import ConfigurationService
 from app.core.exceptions import APException, IngestionError, WorkflowError
 from app.core.schemas import (
     ExtractedInvoice, NormalizedInvoice, DecisionStatus, RuleStatus, RuleSeverity,
@@ -26,6 +26,7 @@ from app.utils.file_storage import save_uploaded_file, validate_document_bytes
 from app.utils.hashing import calculate_file_hash
 from app.ingestion.pdf_loader import PDFLoader
 from app.extraction.extractor import InvoiceExtractor
+from app.extraction.confidence import compute_evidence_ocr_confidence
 from app.processing.normalizer import normalize_invoice
 from app.processing.vendor_matcher import VendorMatcher
 from app.processing.po_matcher import POMatcher
@@ -35,6 +36,8 @@ from app.decision.rules_engine import RulesEngine
 from app.decision.decision_service import DecisionService
 from app.workflow.execution_logger import ExecutionLogger
 from app.utils.logging import get_logger
+from app.utils.time import now_utc
+from app.extraction.llm_provider import get_llm_provider
 
 logger = get_logger("orchestrator")
 
@@ -48,7 +51,10 @@ class WorkflowOrchestrator:
         self.audit_repo = AuditRepository(session)
 
         self.pdf_loader = PDFLoader()
-        self.extractor = InvoiceExtractor()
+        config_service = ConfigurationService(session)
+        config_service.load_rule_thresholds()
+        extraction_mode = config_service.load_extraction_preferences().mode
+        self.extractor = InvoiceExtractor(provider=get_llm_provider(extraction_mode))
         self.vendor_matcher = VendorMatcher(session)
         self.po_matcher = POMatcher(session)
         self.duplicate_detector = DuplicateDetector(session)
@@ -73,7 +79,7 @@ class WorkflowOrchestrator:
         on a transient ``decision_result`` attribute for the caller to render.
         """
         start_time_perf = time.perf_counter()
-        start_time_dt = datetime.now(timezone.utc)
+        start_time_dt = now_utc()
 
         # Temporary placeholders before entity persistence
         invoice_entity: Optional[Invoice] = None
@@ -205,6 +211,19 @@ class WorkflowOrchestrator:
             else:
                 extracted_data = self.extractor.llm_provider.extract_invoice(ingestion_res.full_text)
             extracted_data.document_type = ingestion_res.document_type
+            extracted_data.ocr_confidence = ingestion_res.ocr_confidence
+            extracted_data.ocr_words = ingestion_res.ocr_words
+            extracted_data.ocr_field_confidences = {
+                field_name: field_confidence
+                for field_name in (
+                    "invoice_date", "due_date", "paid_date", "currency",
+                    "subtotal", "tax_amount", "total_amount",
+                )
+                if (field_confidence := compute_evidence_ocr_confidence(
+                    getattr(extracted_data, field_name).evidence,
+                    ingestion_res.ocr_words,
+                )) is not None
+            }
             exec_logger.complete_stage(f"Extracted fields via {self.extractor.llm_provider.provider_name} (conf={extracted_data.overall_confidence:.2f})")
 
             # Stage 8: Validate extracted schema
@@ -308,6 +327,7 @@ class WorkflowOrchestrator:
             invoice_entity.invoice_number = normalized.invoice_number
             invoice_entity.invoice_date = normalized.invoice_date
             invoice_entity.due_date = normalized.due_date
+            invoice_entity.paid_date = normalized.paid_date
             invoice_entity.po_reference = normalized.po_reference
             invoice_entity.currency = normalized.currency
             invoice_entity.subtotal = normalized.subtotal
@@ -463,7 +483,7 @@ class WorkflowOrchestrator:
                 actor="SYSTEM_RULES_ENGINE"
             )
             duration_total_ms = (time.perf_counter() - start_time_perf) * 1000.0
-            run_entity.completion_time = datetime.now(timezone.utc)
+            run_entity.completion_time = now_utc()
             run_entity.current_stage = "COMPLETED"
             run_entity.execution_status = "SUCCESS"
             run_entity.final_decision = decision.status.value
@@ -488,7 +508,7 @@ class WorkflowOrchestrator:
                 invoice_entity.processing_status = "FAILED"
                 invoice_entity.final_decision = DecisionStatus.NEEDS_REVIEW.value
             if run_entity:
-                run_entity.completion_time = datetime.now(timezone.utc)
+                run_entity.completion_time = now_utc()
                 run_entity.current_stage = "FAILED"
                 run_entity.execution_status = "FAILED"
                 run_entity.error_message = str(e)
@@ -552,6 +572,8 @@ class WorkflowOrchestrator:
                 "matched_po_id": invoice.matched_po_id,
                 "po_number": po.po_number if po else None,
                 "invoice_number": invoice.invoice_number,
+                "currency": invoice.currency,
+                "paid_date": invoice.paid_date,
                 "total_amount": round(float(invoice.total_amount), 2) if invoice.total_amount is not None else None,
             }
 
@@ -560,12 +582,13 @@ class WorkflowOrchestrator:
         target_vendor_id = invoice.vendor_id
         target_po_id = invoice.matched_po_id
         target_invoice_number = invoice.invoice_number
+        target_currency = invoice.currency
         target_amount = round(float(invoice.total_amount), 2) if invoice.total_amount is not None else None
 
         # Validate all proposed corrections before mutating the ORM object so a
         # rejected form submission cannot be committed by the caller's session.
         if corrected_fields:
-            allowed_fields = {"vendor_id", "matched_po_id", "invoice_number", "total_amount"}
+            allowed_fields = {"vendor_id", "matched_po_id", "invoice_number", "total_amount", "currency"}
             unexpected = set(corrected_fields) - allowed_fields
             if unexpected:
                 raise APException(f"Unsupported correction fields: {', '.join(sorted(unexpected))}.")
@@ -585,6 +608,12 @@ class WorkflowOrchestrator:
                     raise APException(f"Purchase Order ID {target_po_id} not found.")
             if "invoice_number" in corrected_fields:
                 target_invoice_number = str(corrected_fields["invoice_number"]).strip() or None
+            if "currency" in corrected_fields:
+                currency_value = corrected_fields["currency"]
+                supported_currencies = {"USD", "HKD", "CAD", "AUD", "NZD", "EUR", "GBP", "INR", "JPY", "CNY"}
+                if currency_value is not None and currency_value not in supported_currencies:
+                    raise APException("Corrected invoice currency must be a supported ISO currency code or unconfirmed.")
+                target_currency = currency_value
             if "total_amount" in corrected_fields:
                 try:
                     corrected_amount = round(float(corrected_fields["total_amount"]), 2)
@@ -600,10 +629,13 @@ class WorkflowOrchestrator:
             corrected_po = self.po_repo.get_by_id(target_po_id)
             if corrected_po and corrected_po.vendor_id != target_vendor_id:
                 raise APException("The corrected purchase order must belong to the corrected vendor.")
+            if new_decision == DecisionStatus.APPROVED.value and corrected_po and target_currency != corrected_po.currency:
+                raise APException("An invoice cannot be approved when its currency is unconfirmed or differs from the linked PO.")
 
         invoice.vendor_id = target_vendor_id
         invoice.matched_po_id = target_po_id
         invoice.invoice_number = target_invoice_number
+        invoice.currency = target_currency
         invoice.total_amount = target_amount
 
         new_po_id = invoice.matched_po_id
@@ -659,7 +691,7 @@ class WorkflowOrchestrator:
         invoice.manual_override_decision = new_decision
         invoice.manual_override_reason = clean_reason
         invoice.manual_override_by = clean_actor
-        invoice.manual_override_at = datetime.now(timezone.utc)
+        invoice.manual_override_at = now_utc()
 
         # Audit log entry
         self.audit_repo.log(

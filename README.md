@@ -43,7 +43,7 @@ ap_invoice_engine/
 │   │   └── ocr_engine.py      # Tesseract OCR abstraction with graceful fallback
 │   ├── extraction/
 │   │   ├── extractor.py       # Extraction pipeline coordinator
-│   │   ├── llm_provider.py    # OpenAI-compatible provider & deterministic demo engine
+│   │   ├── llm_provider.py    # Groq provider & deterministic demo engine
 │   │   ├── extraction_prompts.py # Strict Pydantic JSON extraction prompts
 │   │   └── confidence.py      # Multi-factor confidence scoring
 │   ├── processing/
@@ -79,7 +79,7 @@ ap_invoice_engine/
 │   └── sample_data/           # Synthetic test PDF fixtures
 ├── scripts/
 │   ├── seed_database.py       # Seeds 5 vendors, 10 POs, and line items
-│   └── generate_test_invoices.py # Generates 4 scenario test invoice PDFs
+│   └── generate_test_invoices.py # Generates 8 PDF/image scenario fixtures
 └── tests/
     ├── conftest.py            # Isolated in-memory SQLite fixtures
     ├── test_ingestion.py      # PDF classification, text extraction, OCR abstraction
@@ -134,9 +134,22 @@ cd ap_invoice_engine
 ```
 
 ### Step 2: Install Dependencies
+
+In VS Code, open the repository folder, then create and select a project-local
+virtual environment:
+
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+# macOS/Linux
+source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements-dev.txt
 ```
+
+`requirements-dev.txt` includes the runtime packages plus the static checker.
+For a deployment-only installation, use `requirements.txt`.
 
 ### Step 3: Configure Environment Variables
 Copy the template configuration:
@@ -145,12 +158,16 @@ cp .env.example .env
 ```
 Inside `.env`:
 ```env
-# Optional: Provide OpenAI-compatible credentials for live LLM extraction.
+# Optional: Provide Groq credentials for live LLM extraction.
 # If left blank, the application automatically runs in Demo / Offline Mode using
 # the deterministic rule engine (does not hallucinate or make network requests).
 LLM_API_KEY=
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o-mini
+LLM_BASE_URL=https://api.groq.com/openai/v1
+LLM_MODEL=openai/gpt-oss-20b
+LLM_MAX_COMPLETION_TOKENS=8192
+LLM_RETRY_MAX_COMPLETION_TOKENS=16384
+LLM_REASONING_EFFORT=low
+EXTRACTION_MODE=live
 
 # Database Configuration
 DATABASE_URL=sqlite:///data/ap_invoices.db
@@ -164,13 +181,29 @@ OCR_ENABLED=true
 TESSERACT_CMD=
 ```
 
+### Demo versus live extraction
+
+- `demo` is the safe default. It uses the deterministic offline extractor and
+  makes no LLM network request.
+- `live` uses Groq's OpenAI-compatible API. It is available only
+  when `LLM_API_KEY` is set in `.env`, Streamlit secrets, or the deployment
+  environment.
+- The active mode can be changed under **Settings & Rules → Extraction Mode**.
+  The choice is persisted in the database, but API keys are never accepted,
+  displayed, overwritten, or stored by the UI. If live mode loses its runtime
+  credential, the application safely falls back to demo mode.
+- Live structured extraction explicitly allows 8,192 completion tokens and retries once at
+  16,384 when Groq reports truncation or returns `finish_reason=length`. GPT-OSS uses low
+  reasoning effort for this extraction-only task; adjust the token limits with the
+  `LLM_MAX_COMPLETION_TOKENS` and `LLM_RETRY_MAX_COMPLETION_TOKENS` environment variables.
+
 ---
 
 ## 5. Database Initialization & Synthetic Fixtures
 
 The app **self-seeds on first launch**: on startup it creates the tables, seeds
-5 vendors and 10 POs if the database is empty, and generates the 4 benchmark
-invoice PDFs if they are missing. No manual step is required for a fresh deploy.
+5 vendors and 10 POs if the database is empty, and generates the 8 benchmark
+invoice PDF/image fixtures if they are missing. No manual step is required for a fresh deploy.
 
 To seed manually (e.g. for CLI testing):
 
@@ -178,7 +211,7 @@ To seed manually (e.g. for CLI testing):
 # 1. Initialize tables and seed procurement records
 PYTHONPATH=. python3 scripts/seed_database.py
 
-# 2. Generate the 4 benchmark test invoice PDFs
+# 2. Generate the 8 benchmark PDF/image fixtures
 PYTHONPATH=. python3 scripts/generate_test_invoices.py
 ```
 
@@ -189,7 +222,7 @@ PYTHONPATH=. python3 scripts/generate_test_invoices.py
 Launch the Streamlit web dashboard:
 
 ```bash
-PYTHONPATH=. streamlit run app/main.py
+PYTHONPATH=. python3 -m streamlit run app/main.py
 ```
 Open your browser to: **`http://localhost:8501`**
 
@@ -202,7 +235,12 @@ interrupted run retains its last visible stage.
 For a clean demo, start with a fresh disposable database. The clean invoice
 consumes PO balance, so rerunning it against a database with previous runs can
 correctly produce a different decision. Do not reset a database containing
-records you need to keep.
+records you need to keep. The Settings reset control requires confirmation and
+is disabled unless `APP_ENV` is `development` or `test`.
+
+Editable rule thresholds and the extraction-mode choice are stored in the
+configured database, so they survive application restarts (subject to the
+database retention limits of the selected Render plan).
 
 ### Recovery notes
 
@@ -231,8 +269,9 @@ the app to Render Postgres using psycopg 3.
    For longer-lived database retention, upgrade Postgres to a paid plan and set
    backups/retention according to your requirements.
 5. For optional live extraction, add `LLM_API_KEY`, `LLM_BASE_URL`, and
-   `LLM_MODEL` under the Render service's environment settings. Without an API
-   key, the demo extractor remains active. Set `TESSERACT_CMD` only if the
+   `LLM_MODEL`    under the Render service's environment settings, then select Live
+   in the Settings UI (or set `EXTRACTION_MODE=live`). Without an API key, the
+   demo extractor remains active. Set `TESSERACT_CMD` only if the
    container's default `tesseract` executable is unavailable.
 
 The service seeds demo procurement records and fixture files on first launch.
@@ -255,11 +294,17 @@ your local SQLite database.
 Run the full automated unit and integration test suite:
 
 ```bash
-PYTHONPATH=. pytest -v
+PYTHONPATH=. python3 -m pytest -v
+python3 -m mypy
 ```
 
 The tests cover:
 - PDF document classification & OCR abstraction
+- Multi-page text/table extraction, per-page evidence, and unreadable-page fallback
+- Timezone-aware UTC creation and legacy database timestamp loading
+- Foreign-key-safe local database reset
+- Rule threshold validation and persistence across database sessions
+- Demo/live extraction-mode credential gating
 - Schema validation & missing-field null handling
 - Exact and fuzzy vendor matching
 - PO matching & vendor cross-checks
@@ -307,7 +352,19 @@ The system can be tested immediately using the 1-click scenario buttons in the U
 - **Document:** `scenario_5_scanned_low_quality.png`
 - **Issue:** Blurred, low-resolution raster scan of an incomplete invoice.
 - **Outcome:** `NEEDS_REVIEW`
-- **Evidence:** Exercises image OCR and confirms missing/uncertain fields are routed to a reviewer.
+- **Evidence:** Exercises preprocessed image OCR; low OCR confidence, missing scanned line items,
+  or ambiguous currency routes the invoice to a reviewer. A bare `$` is not assumed to mean USD.
+
+### OCR and currency safeguards
+- Small raster images are cropped, deskewed, contrast-normalized, upscaled, and read with Tesseract
+  page segmentation modes 6 and 11. The stronger word-confidence result is retained with the run.
+- OCR word confidence below 55% triggers human review. Scanned invoices without extracted line items
+  also require review; totals are checked against extracted line items plus tax before approval.
+- Currency is only normalized when explicitly identified. Ambiguous symbols such as `$` stay
+  unconfirmed until a reviewer checks the vendor or PO evidence. Manual currency confirmation is
+  recorded in the audit trail.
+- Invoice date, due date, and paid date are separate fields. Existing SQLite/Postgres databases gain
+  the nullable `paid_date` column automatically at startup.
 
 ### Scenario 6: Ambiguous PO
 - **Document:** `scenario_6_ambiguous_po.pdf`
@@ -348,6 +405,9 @@ The reviewer label is user-entered for the case-study demo; it is not authentica
 ### Current Scope & Demo Boundaries
 - **Local development:** Uses thread-safe SQLite with PRAGMA foreign keys enabled. Render demo uses managed Postgres.
 - **Demo identity and retention:** Reviewer names are self-entered, and Render free storage is temporary. Do not use production invoices.
+- **Schema management:** Tables are created automatically, but the project does
+  not yet include a migration framework. The UTC column adapter deliberately
+  preserves the existing physical timestamp schema.
 - **Payment Execution:** Intentionally stops at the approval/escalation decision; does not execute direct banking payments.
 
 ### Next Architecture Steps

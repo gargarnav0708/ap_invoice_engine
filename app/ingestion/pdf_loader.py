@@ -25,7 +25,10 @@ class PageData:
     text: str
     char_count: int
     has_images: bool
+    table_text: str = ""
     image_preview: Optional[Image.Image] = None
+    ocr_confidence: Optional[float] = None
+    ocr_words: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -38,11 +41,27 @@ class IngestionResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     ocr_applied: bool = False
     ocr_unavailable: bool = False
+    ocr_confidence: Optional[float] = None
+    ocr_words: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class PDFLoader:
     def __init__(self):
         self.ocr_engine = get_ocr_engine()
+
+    def _extract_ocr(self, image: Image.Image) -> tuple[str, Optional[float], List[Dict[str, Any]]]:
+        """Support confidence-aware engines and legacy OCR adapters."""
+        word_method = getattr(self.ocr_engine, "extract_text_with_word_confidence", None)
+        if callable(word_method):
+            result = word_method(image)
+            if isinstance(result, tuple) and len(result) == 3:
+                return result
+        confidence_method = getattr(self.ocr_engine, "extract_text_with_confidence", None)
+        if callable(confidence_method):
+            result = confidence_method(image)
+            if isinstance(result, tuple) and len(result) == 2:
+                return result[0], result[1], []
+        return self.ocr_engine.extract_text_from_image(image), None, []
 
     def load_pdf(self, file_path: Path, render_preview: bool = True) -> IngestionResult:
         """
@@ -74,27 +93,49 @@ class PDFLoader:
 
         ocr_applied = False
         ocr_unavailable = False
+        ocr_confidences: List[float] = []
+        all_ocr_words: List[Dict[str, Any]] = []
         pages_data: List[PageData] = []
         full_text_parts: List[str] = []
 
-        # Extract structured tables using pdfplumber where available
-        extracted_tables_text = []
+        # Extract structured tables page-by-page so evidence retains its source.
+        tables_by_page: Dict[int, List[str]] = {}
         try:
             with pdfplumber.open(str(file_path)) as plumber_pdf:
-                for p_idx, p in enumerate(plumber_pdf.pages):
-                    page_tables = p.extract_tables()
-                    for tbl in page_tables:
-                        for row in tbl:
-                            if not row or not any(row):
-                                continue
-                            cleaned_cells = [str(cell).strip().replace("\n", " ") for cell in row if cell is not None]
-                            if len(cleaned_cells) >= 4 and not any(h in cleaned_cells[0].lower() for h in ["description", "item", "invoice"]):
-                                # Format as structured line item representation
-                                desc = cleaned_cells[0]
-                                qty = cleaned_cells[1]
-                                price = cleaned_cells[2]
-                                ltotal = cleaned_cells[3]
-                                extracted_tables_text.append(f"ITEM: {desc} | Qty: {qty} | Price: {price} | Total: {ltotal}")
+                for page_number, plumber_page in enumerate(
+                    plumber_pdf.pages, start=1
+                ):
+                    try:
+                        for table in plumber_page.extract_tables() or []:
+                            for row in table:
+                                if not row or not any(row):
+                                    continue
+                                cells = [
+                                    str(cell).strip().replace("\n", " ")
+                                    for cell in row
+                                    if cell is not None
+                                ]
+                                if len(cells) < 4 or not cells[0]:
+                                    continue
+                                first_cell = cells[0].strip().lower()
+                                if first_cell in {
+                                    "description",
+                                    "item",
+                                    "item description",
+                                    "invoice",
+                                }:
+                                    continue
+                                tables_by_page.setdefault(page_number, []).append(
+                                    f"ITEM: {cells[0]} | "
+                                    f"Qty: {cells[1]} | Price: {cells[2]} | "
+                                    f"Total: {cells[3]}"
+                                )
+                    except Exception as exc:
+                        logger.debug(
+                            "Table extraction skipped for page %s: %s",
+                            page_number,
+                            exc,
+                        )
         except Exception as e:
             logger.debug(f"pdfplumber table extraction skipped: {e}")
 
@@ -102,42 +143,61 @@ class PDFLoader:
             page = doc[page_idx]
             extracted_text = page.get_text("text").strip()
             images_on_page = len(page.get_images()) > 0
+            needs_ocr = len(extracted_text) < 50 and (
+                images_on_page
+                or doc_type in (DocumentType.SCANNED_IMAGE, DocumentType.HYBRID)
+            )
 
             # Render page image if preview is needed or OCR is required
             page_image: Optional[Image.Image] = None
-            if render_preview or (doc_type == DocumentType.SCANNED_IMAGE and len(extracted_text) < 50):
-                pix = page.get_pixmap(dpi=150)
+            if render_preview or needs_ocr:
+                pix = page.get_pixmap(dpi=300 if needs_ocr else 150)
                 img_bytes = pix.tobytes("png")
                 page_image = Image.open(io.BytesIO(img_bytes))
 
             # Run OCR fallback if machine-readable text is insufficient
-            if (doc_type in (DocumentType.SCANNED_IMAGE, DocumentType.HYBRID)) and len(extracted_text) < 50:
+            if needs_ocr:
+                page_ocr_confidence = None
+                page_ocr_words: List[Dict[str, Any]] = []
                 if page_image:
-                    ocr_text = self.ocr_engine.extract_text_from_image(page_image)
+                    ocr_text, page_ocr_confidence, page_ocr_words = self._extract_ocr(page_image)
                     if ocr_text:
                         extracted_text = (extracted_text + "\n" + ocr_text).strip()
                         ocr_applied = True
+                        if page_ocr_confidence is not None:
+                            ocr_confidences.append(page_ocr_confidence)
+                        for word in page_ocr_words:
+                            word_with_page = {**word, "page": page_idx + 1}
+                            all_ocr_words.append(word_with_page)
                     else:
                         ocr_unavailable = True
                 else:
                     ocr_unavailable = True
 
+            table_text = "\n".join(tables_by_page.get(page_idx + 1, []))
+            page_text = extracted_text
+            if table_text:
+                page_text = (
+                    f"{page_text}\n--- Page {page_idx + 1} Structured Table ---\n"
+                    f"{table_text}"
+                ).strip()
+
             pages_data.append(
                 PageData(
                     page_number=page_idx + 1,
-                    text=extracted_text,
-                    char_count=len(extracted_text),
+                    text=page_text,
+                    char_count=len(page_text),
                     has_images=images_on_page,
-                    image_preview=page_image
+                    table_text=table_text,
+                    image_preview=page_image,
+                    ocr_confidence=page_ocr_confidence if needs_ocr and page_image else None,
+                    ocr_words=page_ocr_words if needs_ocr and page_image else [],
                 )
             )
-            if extracted_text:
-                full_text_parts.append(f"--- Page {page_idx + 1} ---\n{extracted_text}")
+            if page_text:
+                full_text_parts.append(f"--- Page {page_idx + 1} ---\n{page_text}")
 
         doc.close()
-
-        if extracted_tables_text:
-            full_text_parts.append("--- Extracted Line Items Table ---\n" + "\n".join(extracted_tables_text))
 
         full_text = "\n\n".join(full_text_parts)
         logger.info(
@@ -153,7 +213,9 @@ class PDFLoader:
             pages=pages_data,
             metadata=meta,
             ocr_applied=ocr_applied,
-            ocr_unavailable=ocr_unavailable
+            ocr_unavailable=ocr_unavailable,
+            ocr_confidence=min(ocr_confidences) if ocr_confidences else None,
+            ocr_words=all_ocr_words,
         )
 
     def _load_image(self, file_path: Path, render_preview: bool = True) -> IngestionResult:
@@ -173,12 +235,18 @@ class PDFLoader:
         text_parts: List[str] = []
         ocr_applied = False
         ocr_unavailable = False
+        ocr_confidences: List[float] = []
+        all_ocr_words: List[Dict[str, Any]] = []
         for page_number, frame in enumerate(frames, start=1):
             preview = ImageOps.exif_transpose(frame).convert("RGB")
-            text = self.ocr_engine.extract_text_from_image(preview).strip()
+            text, page_ocr_confidence, page_ocr_words = self._extract_ocr(preview)
+            text = text.strip()
             if text:
                 ocr_applied = True
                 text_parts.append(f"--- Page {page_number} ---\n{text}")
+                if page_ocr_confidence is not None:
+                    ocr_confidences.append(page_ocr_confidence)
+                all_ocr_words.extend({**word, "page": page_number} for word in page_ocr_words)
             else:
                 ocr_unavailable = True
             pages.append(PageData(
@@ -187,6 +255,8 @@ class PDFLoader:
                 char_count=len(text),
                 has_images=True,
                 image_preview=preview if render_preview else None,
+                ocr_confidence=page_ocr_confidence,
+                ocr_words=page_ocr_words,
             ))
 
         full_text = "\n\n".join(text_parts)
@@ -203,4 +273,6 @@ class PDFLoader:
             metadata={"image_format": image_format, "image_size": image_size},
             ocr_applied=ocr_applied,
             ocr_unavailable=ocr_unavailable,
+            ocr_confidence=min(ocr_confidences) if ocr_confidences else None,
+            ocr_words=all_ocr_words,
         )

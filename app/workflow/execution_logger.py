@@ -1,12 +1,12 @@
 """
 Execution logger for tracking workflow stage progression, durations, and statuses.
 """
-from datetime import datetime, timezone
 import time
 from typing import List, Optional, Callable
 import json
 
 from app.core.schemas import StageStatus, StageExecutionRecord
+from app.utils.time import now_utc
 
 
 class ExecutionLogger:
@@ -35,7 +35,7 @@ class ExecutionLogger:
         """Marks a stage as started."""
         self._current_stage_name = stage_name
         self._stage_start_perf = time.perf_counter()
-        self._stage_start_dt = datetime.now(timezone.utc).isoformat()
+        self._stage_start_dt = now_utc().isoformat()
         self._emit({
             "type": "start", "stage_name": stage_name,
             "start_time": self._stage_start_dt,
@@ -51,8 +51,8 @@ class ExecutionLogger:
             StageExecutionRecord(
                 stage_name=stage_name,
                 status=StageStatus.COMPLETED,
-                start_time=self._stage_start_dt or datetime.now(timezone.utc).isoformat(),
-                completion_time=datetime.now(timezone.utc).isoformat(),
+                start_time=self._stage_start_dt or now_utc().isoformat(),
+                completion_time=now_utc().isoformat(),
                 duration_ms=round(duration_ms, 2),
                 details=details
             )
@@ -73,8 +73,8 @@ class ExecutionLogger:
             StageExecutionRecord(
                 stage_name=stage_name,
                 status=StageStatus.FAILED,
-                start_time=self._stage_start_dt or datetime.now(timezone.utc).isoformat(),
-                completion_time=datetime.now(timezone.utc).isoformat(),
+                start_time=self._stage_start_dt or now_utc().isoformat(),
+                completion_time=now_utc().isoformat(),
                 duration_ms=round(duration_ms, 2),
                 error=error_message
             )
@@ -91,8 +91,8 @@ class ExecutionLogger:
             StageExecutionRecord(
                 stage_name=stage_name,
                 status=StageStatus.SKIPPED,
-                start_time=datetime.now(timezone.utc).isoformat(),
-                completion_time=datetime.now(timezone.utc).isoformat(),
+                start_time=now_utc().isoformat(),
+                completion_time=now_utc().isoformat(),
                 duration_ms=0.0,
                 details=reason
             )

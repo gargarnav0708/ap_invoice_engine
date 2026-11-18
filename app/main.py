@@ -4,6 +4,7 @@ Main Streamlit application entry point.
 """
 import streamlit as st
 from app.config.settings import settings
+from app.config.persistence import ConfigurationService
 from app.database.db import engine, init_db, get_db
 from app.utils.logging import get_logger
 from app.ingestion.ocr_engine import get_ocr_engine
@@ -53,6 +54,7 @@ def _bootstrap() -> bool:
         from app.database.entities import Vendor
         with get_db() as session:
             vendor_count = session.query(Vendor).count()
+            ConfigurationService(session).load_rule_thresholds()
         if vendor_count == 0:
             from scripts.seed_database import seed
             seed()
@@ -74,6 +76,11 @@ _bootstrap()
 
 
 def main():
+    with get_db() as config_session:
+        extraction_mode = ConfigurationService(
+            config_session
+        ).load_extraction_preferences().mode
+
     # Sidebar Navigation & Branding
     with st.sidebar:
         st.markdown("# ⚡ **Zamp AP Engine**")
@@ -104,7 +111,7 @@ def main():
 
         st.markdown("---")
         # System status indicator in sidebar
-        if settings.has_live_llm:
+        if extraction_mode == "live":
             st.success(f"🟢 **AI Extraction:** Live ({settings.LLM_MODEL})")
         else:
             st.info("🟡 **AI Extraction:** Demo / Rule Engine")

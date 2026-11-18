@@ -12,10 +12,13 @@ CRITICAL EXTRACTION RULES:
    - "confidence": A float between 0.0 and 1.0 representing how clearly the field is stated.
    - "evidence": The exact verbatim text snippet from the document supporting the extraction.
    - "page": The page number where the information was found.
+   Keep evidence to the shortest exact snippet that supports the value. For line items, reuse the concise source row rather than copying surrounding invoice text.
 4. Extract all line items accurately. For each line item, extract description, quantity, unit, unit_price, tax_amount, and line_total.
 5. All amounts must be numbers (e.g. 1250.50, not "$1,250.50").
 6. Dates should be in ISO 8601 (YYYY-MM-DD) format if decipherable, or verbatim string if ambiguous.
-7. Return strictly valid JSON matching the required schema.
+7. Extract invoice_date, due_date, and paid_date as separate concepts. A "Paid" or "Payment Date" label is not the due date.
+8. Extract currency only when the document states an ISO currency code or an unambiguous currency symbol. A bare "$" is ambiguous: return null and preserve "$" as evidence; do not assume USD.
+9. Return strictly valid JSON matching the required schema.
 """
 
 EXTRACTION_JSON_SCHEMA = {
@@ -27,6 +30,7 @@ EXTRACTION_JSON_SCHEMA = {
         "invoice_number": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},
         "invoice_date": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},
         "due_date": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},
+        "paid_date": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},
         "po_reference": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},
         "currency": {"type": "object", "properties": {"value": {"type": ["string", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},
         "subtotal": {"type": "object", "properties": {"value": {"type": ["number", "null"]}, "confidence": {"type": "number"}, "evidence": {"type": ["string", "null"]}, "page": {"type": "integer"}}, "required": ["value", "confidence"]},

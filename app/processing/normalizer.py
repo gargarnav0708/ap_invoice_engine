@@ -38,25 +38,36 @@ def normalize_vendor_name(name: Optional[str]) -> str:
     return cleaned
 
 
-def normalize_currency(curr: Optional[str]) -> str:
-    """Standardizes currency to ISO 4217 code."""
+def normalize_currency(curr: Optional[str]) -> Optional[str]:
+    """Standardizes currency only when the source unambiguously identifies it."""
     if not curr:
-        return "USD"
+        return None
     curr_upper = curr.strip().upper()
     mapping = {
-        "$": "USD", "US$": "USD", "USD": "USD",
+        "US$": "USD", "USD": "USD",
         "€": "EUR", "EUR": "EUR",
         "£": "GBP", "GBP": "GBP",
-        "¥": "JPY", "JPY": "JPY",
-        "CAD": "CAD", "AUD": "AUD", "INR": "INR", "₹": "INR"
+        "HK$": "HKD", "HKD": "HKD", "CA$": "CAD", "CAD": "CAD",
+        "A$": "AUD", "AUD": "AUD", "NZ$": "NZD", "NZD": "NZD",
+        "JPY": "JPY", "CNY": "CNY", "INR": "INR", "₹": "INR",
     }
-    return mapping.get(curr_upper, curr_upper[:3])
+    if curr_upper in mapping:
+        return mapping[curr_upper]
+    return curr_upper if re.fullmatch(r"[A-Z]{3}", curr_upper) else None
 
 
 def normalize_date(date_str: Optional[str]) -> Optional[str]:
     """Parses date string into standard ISO 8601 (YYYY-MM-DD)."""
     if not date_str:
         return None
+    for date_format in (
+        "%B %d, %Y", "%B %d,%Y", "%b %d, %Y", "%b %d,%Y",
+        "%B %d %Y", "%b %d %Y",
+    ):
+        try:
+            return datetime.strptime(date_str.strip(), date_format).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
     try:
         dt = date_parser.parse(date_str)
         return dt.strftime("%Y-%m-%d")
@@ -120,6 +131,7 @@ def normalize_invoice(extracted: ExtractedInvoice) -> NormalizedInvoice:
         normalized_invoice_number=normalize_identifier(extracted.invoice_number.value),
         invoice_date=normalize_date(extracted.invoice_date.value),
         due_date=normalize_date(extracted.due_date.value),
+        paid_date=normalize_date(extracted.paid_date.value),
         po_reference=extracted.po_reference.value,
         normalized_po_reference=normalize_identifier(extracted.po_reference.value),
         currency=normalize_currency(extracted.currency.value),

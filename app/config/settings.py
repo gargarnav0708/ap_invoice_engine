@@ -29,9 +29,15 @@ class Settings(BaseSettings):
 
     # LLM Provider
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
-    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    LLM_BASE_URL: str = os.getenv(
+        "LLM_BASE_URL", "https://api.groq.com/openai/v1"
+    )
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
+    LLM_MAX_COMPLETION_TOKENS: int = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "8192"))
+    LLM_RETRY_MAX_COMPLETION_TOKENS: int = int(os.getenv("LLM_RETRY_MAX_COMPLETION_TOKENS", "16384"))
+    LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "low").strip().lower()
     ENABLE_DEMO_MODE: bool = os.getenv("ENABLE_DEMO_MODE", "true").lower() in ("true", "1", "yes")
+    EXTRACTION_MODE: str = os.getenv("EXTRACTION_MODE", "")
 
     # OCR Settings
     OCR_ENABLED: bool = os.getenv("OCR_ENABLED", "true").lower() in ("true", "1", "yes")
@@ -45,6 +51,18 @@ class Settings(BaseSettings):
     def has_live_llm(self) -> bool:
         """Returns True if LLM credentials are configured."""
         return bool(self.LLM_API_KEY.strip())
+
+    @property
+    def default_extraction_mode(self) -> str:
+        """Return the safe startup mode, retaining ENABLE_DEMO_MODE compatibility."""
+        configured = self.EXTRACTION_MODE.strip().lower()
+        if configured == "live":
+            return "live" if self.has_live_llm else "demo"
+        if configured == "demo":
+            return "demo"
+        if self.ENABLE_DEMO_MODE:
+            return "demo"
+        return "live" if self.has_live_llm else "demo"
 
     def ensure_directories(self) -> None:
         """Create necessary project data directories."""

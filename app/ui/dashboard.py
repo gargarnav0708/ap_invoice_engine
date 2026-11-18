@@ -125,7 +125,10 @@ def render_dashboard(session: Session):
                 "Filename": inv.original_filename,
                 "Vendor": vendor_name,
                 "Invoice #": inv.invoice_number or "N/A",
-                "Amount": f"${inv.total_amount:.2f}" if inv.total_amount is not None else "N/A",
+                "Amount": (
+                    f"{inv.currency or 'Currency unconfirmed'} {inv.total_amount:.2f}"
+                    if inv.total_amount is not None else "N/A"
+                ),
                 "Confidence": f"{inv.extraction_confidence*100:.0f}%",
                 "Status": effective_dec,
                 "Processed At": inv.created_at.strftime("%Y-%m-%d %H:%M:%S")
