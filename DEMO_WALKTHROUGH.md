@@ -1,124 +1,65 @@
-# End-to-End Demo Walkthrough Script (5–7 Minutes)
+# Demo Walkthrough Script (Focused on What Was Built & Why)
 
-This script gives you a **click-by-click path** and **spoken talking points** to demonstrate the **Zamp AI-Powered Accounts Payable (AP) Automation & Decision Engine** in an interview or live presentation.
-
----
-
-## Pre-Demo Checklist (30 Seconds Before Starting)
-
-1. Start the application from VS Code or terminal:
-   ```bash
-   source .venv/bin/activate
-   streamlit run app/main.py
-   ```
-2. Open **Settings & Rules → Database Operations**, check *"I understand this deletes local demo transaction data"*, and click **🔄 Reset & Reseed Database** so PO balances start fresh (`PO-2026-001` at `$2,500.00`, `PO-2026-002` at `$500.00`).
-3. In the sidebar, confirm:
-   - **Theme:** `☀️ Light` (you will toggle `🌙 Dark` during Step 1)
-   - **AI Extraction:** `Live` (Groq `openai/gpt-oss-20b`) or `Demo` (deterministic rule engine)
-   - **Footer:** `DB: Sqlite | OCR: Tesseract ready`
+**Pre-Demo Reset (10s):** Open **Settings & Rules → 🔄 Reset & Reseed Database** so PO balances start clean.
 
 ---
 
-## 0:00–0:45 — 1. Frame the Problem & Core Architecture (`Overview Dashboard`)
-
-**Where to click:**
-- Start on **Overview Dashboard**.
-- Toggle the sidebar **Theme** from `☀️ Light` to `🌙 Dark` and back to show session-scoped theming.
-
-**What to say:**
-> *"In enterprise Accounts Payable, finance teams manually review hundreds of vendor PDFs and scans every week—extracting fields, hunting down Purchase Orders, checking vendor tax IDs, converting currencies, verifying line-item math, and watching for duplicate submissions. It’s slow and error-prone.*
->
-> *We built an end-to-end AP Decision Engine around one strict architectural principle: **AI interprets unstructured documents, but deterministic code makes financial decisions.** The LLM extracts structured fields with per-field confidence and verbatim evidence snippets, our probabilistic matching engine links Vendors and POs even when formatted differently, and a deterministic rules engine decides whether to auto-approve, block, or route to human review.*
->
-> *Notice the dashboard reports all approved spend in **Indian Rupees (INR ₹)**, automatically converting USD and multi-currency invoices at the configured FX rate."*
+### 1. Intro & Core Architecture (`Overview Dashboard` — 20s)
+* **What was built:** An end-to-end AP engine where **AI only extracts unstructured fields**, a **probabilistic matcher** links Vendors/POs, and **deterministic code** enforces financial rules and reports all spend in **INR (₹)** (auto-converting USD/foreign currencies).
+* **Why it helps:** Eliminates manual PDF data entry while guaranteeing an LLM can never hallucinate a PO or approve an invalid payment.
+* **Say:**
+  > *"We built an AP automation engine that separates AI extraction from deterministic financial rules: the LLM extracts invoice fields with verbatim evidence, a probabilistic engine links Vendors and POs, and deterministic code approves, blocks, or routes to review—with all spend converted and reported in **INR (₹)**."*
 
 ---
 
-## 0:45–1:45 — 2. Onboard a Vendor, Issue a PO & Show the Probabilistic Matcher (`Vendors & Purchase Orders`)
-
-**Where to click:**
-1. Click **Vendors & Purchase Orders** in the sidebar.
-2. On **🏢 Vendors Directory & Onboarding**, point out the registration form (Legal Name, Tax ID / GSTIN, Country `IND — India (₹ INR)`, Approved status) and the registered vendors table below.
-3. Switch to **📑 Purchase Orders & Line Items** and point out the multi-row Line Items builder and the PO registry showing both **native currency** and **INR (₹) equivalent remaining balances**.
-4. Switch to the 3rd tab: **🎯 Probabilistic Matcher & Confidence Simulator**.
-   - Leave the default test inputs (`M/s Acme Ind. Supply`, `P.O. #2026/01`, `Ind. Safety Helmets`) or edit them live.
-
-**What to say:**
-> *"Procurement teams can onboard vendors and issue Purchase Orders in INR, USD, or 10 other currencies directly inside the app.*
->
-> *In the real world, vendors rarely format their names or PO references the same way twice. Instead of brittle exact-string constraints, we built a **multi-signal probabilistic matching model**. Here in the live simulator, even when an invoice says `'M/s Acme Ind. Supply'` instead of `'Acme Industrial Supplies Inc.'` and formats the PO as `'P.O. #2026/01'` instead of `'PO-2026-001'`, our engine expands abbreviations, computes token-set Dice and containment scores, normalizes numeric segments and OCR look-alikes, and matches both the Vendor and the PO with **95%+ confidence**—while also guarding against near-duplicate vendor or PO creation."*
+### 2. In-App Vendor/PO Onboarding & Probabilistic Matcher (`Vendors & Purchase Orders` — 60s)
+* **Click:** **Vendors & Purchase Orders** → show **Vendors** tab → **Purchase Orders** tab → **🎯 Probabilistic Matcher & Confidence Simulator** tab.
+* **What was built:**
+  1. In-app onboarding for Vendors (Tax ID/GSTIN, Country, approval toggle) and multi-line POs in `INR` or `USD`.
+  2. A **4-signal probabilistic matching engine** (abbreviation expansion like `Ind.` → `Industrial`, order-invariant token Dice, token containment, numeric-segment & OCR look-alike normalization for PO numbers, and FX-converted amount/line-item fit).
+* **Why it helps:** Vendors rarely format their name (`"M/s Acme Ind. Supply"` vs `"Acme Industrial Supplies Inc."`) or PO number (`"P.O. #2026/01"` vs `"PO-2026-001"`) identically to internal records. Exact-match systems fail on valid invoices; our probabilistic model matches them at **95%+ confidence** and prevents duplicate vendor/PO creation.
+* **Say:**
+  > *"Here we can onboard vendors and issue POs in INR or USD. Because vendors format names and POs inconsistently on invoices, we built a multi-signal probabilistic matcher instead of exact string matching. In the simulator, `'M/s Acme Ind. Supply'` and `'P.O. #2026/01'` match `'Acme Industrial Supplies Inc.'` and `'PO-2026-001'` at **95%+ confidence** across abbreviation expansion, token overlap, and numeric-segment normalization."*
 
 ---
 
-## 1:45–2:40 — 3. Clean 3-Way Match & Automatic PO Reservation (`Upload Invoice → Scenario 1`)
-
-**Where to click:**
-1. Click **Upload Invoice** in the sidebar.
-2. Point out that **Upload Document** supports both **single-file live streaming** and **multi-file batch upload** with per-document error isolation.
-3. Open the **Quick Test Scenarios (1-Click)** tab and click **▶ Run Scenario 1** (*Clean Invoice*).
-
-**What to say:**
-> *"Let’s run Scenario 1: a clean invoice from Acme Industrial Supplies billing `$1,350.00` against `PO-2026-001`. Watch the **19 pipeline stages** stream live—file validation, SHA-256 hashing, duplicate check, text extraction, structured extraction, normalization, probabilistic vendor and PO matching, line-item comparison, financial math, and atomic PO balance reservation.*
->
-> *Every check passes, so the invoice is **AUTOMATICALLY APPROVED**. The decision card displays both the native `$1,350.00` total and its converted **`₹113,400.00` INR equivalent**, and `PO-2026-001`’s remaining balance is atomically reduced from `$2,500.00` to `$1,150.00`."*
+### 3. 19-Stage Live Pipeline & Atomic PO Balance Control (`Upload Invoice → Scenarios 1 & 3` — 60s)
+* **Click:** **Upload Invoice → Quick Test Scenarios** → run **▶ Scenario 1 (Clean Invoice)**, then run **▶ Scenario 3 (Split PO Overbilling)**.
+* **What was built:**
+  1. Single-file live 19-stage execution stream + multi-file batch uploader with per-document error isolation.
+  2. Deterministic 3-way validation (line math, subtotal/tax, chronology, 4-tier duplicate detection) and **atomic cent-exact SQL PO balance reservation**.
+* **Why it helps:** Approves clean invoices in milliseconds (converting `$1,350.00` → `₹113,400.00` and deducting the PO balance), while hard-blocking split invoices that exceed remaining PO budget (`$1,100` billed against `$500` remaining on `PO-2026-002`) so a PO can never be over-paid.
+* **Say:**
+  > *"Scenario 1 runs all 19 stages live, passes every math and 3-way match rule, auto-approves `$1,350` (`₹113,400`), and atomically deducts the PO balance. Scenario 3 bills `$1,100` against a PO with only `$500` remaining—Stage 15 catches the `$600` overage and hard-blocks payment."*
 
 ---
 
-## 2:40–3:30 — 4. Hard Financial Controls: Duplicate & Split-PO Overbilling (`Scenarios 2 & 3`)
-
-**Where to click:**
-1. On **Upload Invoice → Quick Test Scenarios (1-Click)**, click **▶ Run Scenario 3** (*Split PO Overbilling*).
-2. Scroll to the red **✕ Blocked** decision card and point to the `Why` section (`RULE_PO_BALANCE_EXCEEDED`).
-3. (Optional) Click **▶ Run Scenario 7** (*Changed-PDF Near Duplicate*, which compares against Scenario 1) or **▶ Run Scenario 2** (*Exact Duplicate*).
-
-**What to say:**
-> *"Now let’s test a hard stop. In Scenario 3, `PO-2026-002` has `$5,000.00` total budget, `$4,500.00` already billed, and only **`$500.00` remaining**. This invoice bills **`$1,100.00`**.*
->
-> *Even though the vendor is approved and the invoice arithmetic is valid, Stage 15 catches the `$600.00` overage and immediately **BLOCKS** the invoice with a hard failure. Because our database reservation in Stage 18 uses an atomic conditional SQL update in cents, two concurrent invoices can never overdraw a PO."*
+### 4. OCR Confidence & Auto-Polling Trace (`Scenario 5` & `Live Processing View` — 40s)
+* **Click:** Run **▶ Scenario 5 (Low-Quality Scan)** → open **Live Processing View**.
+* **What was built:** Automatic document classification (digital vs. scanned), Tesseract OCR fallback with word-level confidence per evidence snippet, and a persisted stage timeline that auto-polls active runs via `st.fragment`.
+* **Why it helps:** Degraded scans or missing fields never get guessed by AI—low OCR confidence deterministically routes the invoice to `NEEDS_REVIEW`, and every stage trace is saved to SQL even if a run fails mid-way.
+* **Say:**
+  > *"Scenario 5 is a blurry raster image. The engine auto-engages OCR, scores word-level confidence on each extracted snippet, and routes missing fields to `NEEDS_REVIEW` rather than guessing. Live Processing View persists and auto-polls every stage."*
 
 ---
 
-## 3:30–4:15 — 5. OCR Fallback & Safe Routing on Low-Quality Scans (`Scenario 5` & `Live Processing View`)
-
-**Where to click:**
-1. On **Upload Invoice → Quick Test Scenarios (1-Click)**, click **▶ Run Scenario 5** (*Low-Quality Scan*).
-2. Once it finishes with **! Needs review**, click **Live Processing View** in the sidebar.
-3. Expand Stage 6 (*Run OCR when necessary*) and Stage 7 (*Extract structured invoice information*).
-
-**What to say:**
-> *"Scenario 5 is a blurred raster scan with missing fields. The document classifier detects that it’s an image, engages Tesseract OCR with word-level confidence scoring, and routes the invoice to **`NEEDS_REVIEW`**—never guessing missing PO numbers or tax amounts.*
->
-> *In **Live Processing View**, every stage’s status, duration, and evidence is persisted to the database as it executes, and active runs auto-refresh via `st.fragment` polling without blocking the UI."*
-
----
-
-## 4:15–5:30 — 6. Deep Audit Workbench, PDF Highlighting, Manual Override & Accounting Export (`Scenario 6` → `Invoice Details` → `Invoice History`)
-
-**Where to click:**
-1. Go to **Upload Invoice → Quick Test Scenarios (1-Click)** and click **▶ Run Scenario 6** (*Ambiguous PO*).
-2. Click **Invoice Details** in the sidebar (it automatically selects the newly processed invoice).
-3. In **📄 Document Preview**:
-   - Change **Zoom** to `125%`, test **Rotate** (`↻ 90°` and back to `↻ 0°`), and check **Highlight extracted fields** (or type `TechNova` in *Find text on page*) to show translucent bounding boxes drawn directly on the PDF page.
-4. Point to **Extracted Structured Fields** (per-field confidence, OCR confidence, verbatim evidence snippet, and converted `INR ₹` amounts) and **3-Way Procurement Comparison** (showing the vendor’s **Probabilistic Confidence %**).
-5. Scroll to **✍️ Human-in-the-Loop Review & Decision Override**:
-   - Open **Optional reviewer corrections**, select `PO-2026-004 — TechNova Solutions Inc.`, set **Select Override Decision** to `✓ Approved (APPROVED)`, enter a justification reason (`"Confirmed against statement of work; linked to PO-2026-004"`), and click **💾 Save Manual Override & Update Audit Trail**.
-6. Scroll down to **📜 Complete Audit Trail** and expand **Reviewer corrections — before and after** to show the immutable diff (`Before → After`) and PO balance reservation.
-7. Click **⬇️ Export Xero Bills CSV**, **⬇️ Export QuickBooks CSV**, or **⬇️ Export Audit JSON** at the top of the page (or navigate to **Invoice History** to show SQL-backed `LIMIT/OFFSET` pagination and batch page exports).
-
-**What to say:**
-> *"Finally, let’s resolve an exception as an AP analyst. Scenario 6 is from TechNova Solutions with no PO number printed on the invoice, and TechNova has two open POs—so the engine safely routes it to **`NEEDS_REVIEW`**.*
->
-> *In **Invoice Details**, the analyst can navigate multi-page PDFs, zoom, rotate sideways scans, and toggle **Highlight extracted fields** to visually spotlight the extracted values right on the PDF page. Alongside it, we see per-field extraction confidence, OCR word confidence, verbatim evidence, and the probabilistic vendor match score.*
->
-> *Using the **Human-in-the-Loop Override** form, I link the correct PO (`PO-2026-004`), approve the invoice, and enter a mandatory justification. The engine atomically reserves the PO balance, preserves the original AI extraction payload untouched, and records a complete **before-and-after diff** in the immutable audit trail. From here—or from our SQL-paginated **Invoice History**—we can export ready-to-import **Xero Bills CSV**, **QuickBooks Online CSV**, or **Audit JSON** in one click."*
+### 5. Audit Workbench, PDF Field Highlighting, Override & ERP Export (`Scenario 6` → `Invoice Details` → `Invoice History` — 75s)
+* **Click:**
+  1. Run **▶ Scenario 6 (Ambiguous PO)** → open **Invoice Details**.
+  2. In **Document Preview**, toggle **Highlight extracted fields** (and `Zoom 125%` / `Rotate`).
+  3. In **Human-in-the-Loop Override**, link `PO-2026-004`, set decision to `APPROVED`, enter a reason, and click **💾 Save Manual Override**.
+  4. Expand **Reviewer corrections — before and after** in the audit trail, then click **⬇️ Export Xero Bills CSV** / **QuickBooks CSV** (and show SQL-paginated **Invoice History**).
+* **What was built:**
+  1. Bounded single-page PDF viewer with page navigation, zoom, rotation, and **on-page bounding-box highlighting** of extracted fields.
+  2. Human override workflow that preserves the raw AI extraction, atomically reconciles PO balances, logs a **before/after field diff**, and exports to **Xero CSV, QuickBooks CSV, Generic CSV, and Audit JSON**.
+  3. SQL `LIMIT/OFFSET` pagination in **Invoice History** with deterministic `created_at DESC, id DESC` ordering.
+* **Why it helps:** Gives AP analysts instant visual proof on the PDF, full audit traceability for compliance, scalable history queries, and 1-click ERP import files without re-typing data.
+* **Say:**
+  > *"On Scenario 6, the vendor omitted the PO number and has two open POs, so it routes to review. In Invoice Details, checking **Highlight extracted fields** draws bounding boxes directly around the extracted values on the PDF. I can link `PO-2026-004` and approve with a mandatory reason—which atomically updates the PO balance, logs a before/after diff in the immutable audit trail, and lets us export directly to Xero or QuickBooks CSV."*
 
 ---
 
-## 5:30–6:00 — 7. Closing: Policy Governance & Local Test Suite (`Settings & Rules`)
-
-**Where to click:**
-- Click **Settings & Rules** in the sidebar.
-- Point out **Extraction Mode** (`Demo` vs `Live LLM`), **Financial Validation & Matching Tolerances**, **`USD → INR Exchange Rate`**, and **Developer Diagnostics** (`🧪 Run Automated Test Suite (pytest -q)`).
-
-**What to say:**
-> *"Under **Settings & Rules**, finance admins can tune arithmetic tolerances, near-duplicate windows, fuzzy match thresholds, and the **`USD → INR` exchange rate**—all validated by Pydantic and persisted in the database across restarts. And in local development, engineers can run the entire **78-test automated pytest suite** right from the diagnostics panel."*
+### 6. Live Policy & FX Controls (`Settings & Rules` — 20s)
+* **Click:** **Settings & Rules**.
+* **What was built:** Database-persisted rule thresholds, Demo/Live LLM switch, configurable **`USD → INR` exchange rate**, and a local-only `pytest` runner.
+* **Why it helps:** Finance teams can adjust tolerances and FX rates at runtime without code changes or redeployments.
